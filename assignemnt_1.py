@@ -2,11 +2,7 @@ import robotica
 import time
 
 class SimpleWallFollower:
-    """
-    Simple, reliable PID wall follower that sticks to one side.
-    States: FIND -> FOLLOW -> CORNER (when needed) -> back to FOLLOW
-    """
-    
+
     def __init__(self,
                  base_speed=0.6,
                  follow_side='left',
@@ -41,8 +37,9 @@ class SimpleWallFollower:
         # Track when wall disappears to follow it around corners
         self.wall_lost_counter = 0
         self.turning_to_follow = False
-        
-        # Corner escape parameters - slower and more controlled
+        self.wall_lost_steps = 25
+
+        # Corner escape parameters 
         self.back_duration = 10
         self.turn_duration = 10
         self.forward_duration = 8
@@ -50,16 +47,19 @@ class SimpleWallFollower:
     def get_sensor(self, dist, idx):
         """Get valid sensor reading or None."""
         v = dist[idx]
-        if v is None or v >= 0.95:
+        if v is None or v > 1.0:
             return None
         return v
     
     def get_side_distance(self, dist):
-        """Get average distance from the followed side (left or right)."""
+        """Get array with:
+            - Average distance from the followed side (left or right).
+            - Distance from the front sensor on that side.
+            - Distance from the back sensor on that side."""
         if self.follow_side == 'left':
-            front_idx, back_idx = 0, 15  # Left sensors
+            front_idx, back_idx = 0, 15     # Left sensors
         else:
-            front_idx, back_idx = 7, 8    # Right sensors
+            front_idx, back_idx = 7, 8      # Right sensors
         
         front = self.get_sensor(dist, front_idx)
         back = self.get_sensor(dist, back_idx)
@@ -68,7 +68,7 @@ class SimpleWallFollower:
         if not readings:
             return None, None, None
         
-        return sum(readings) / len(readings), front, back
+        return sum(readings)/len(readings), front, back
     
     def get_front_distance(self, dist):
         """Get minimum front distance."""
@@ -80,30 +80,33 @@ class SimpleWallFollower:
         return min(front_readings) if front_readings else 1.0
     
     def start_corner_escape(self):
-        """Enter corner escape mode."""
+        """Setter to enter corner mode."""
         self.mode = 'CORNER'
         self.corner_phase = 'back'
         self.corner_step = 0
         self.integral_error = 0  # Reset integral
         print("CORNER DETECTED → Starting escape sequence")
     
-    def handle_corner(self, dist):
-        """Execute corner escape: back up, turn away from wall, move forward."""
+    def handle_corner(self):
+        """Execute corner escape: 
+            1. back up
+            2. turn away from wall
+            3. move forward."""
         self.corner_step += 1
         
         if self.corner_phase == 'back':
-            # Back up
+            # Back up, paratemeters adjusted for smoother motion
             if self.follow_side == 'left':
                 left, right = -0.10, -0.15
             else:
                 left, right = -0.15, -0.10
             
-            print(f"  ↩ Backing up [{self.corner_step}/{self.back_duration}]")
+            print(f"    Backing up [{self.corner_step}/{self.back_duration}]")
             
             if self.corner_step >= self.back_duration:
                 self.corner_phase = 'turn'
                 self.corner_step = 0
-                print("   Starting turn...")
+                print("     Starting turn...")
             
             return left, right
         
@@ -114,12 +117,12 @@ class SimpleWallFollower:
             else:
                 left, right = -0.25, 0.25  # Turn left (away from right wall)
             
-            print(f"  🔄 Turning [{self.corner_step}/{self.turn_duration}]")
+            print(f"    Turning [{self.corner_step}/{self.turn_duration}]")
             
             if self.corner_step >= self.turn_duration:
                 self.corner_phase = 'forward'
                 self.corner_step = 0
-                print("  ➡ Moving forward...")
+                print("    Moving forward...")
             
             return left, right
         
@@ -127,12 +130,12 @@ class SimpleWallFollower:
             # Move forward to clear the corner
             left = right = self.base_speed
             
-            print(f"  ➡ Forward recovery [{self.corner_step}/{self.forward_duration}]")
+            print(f"    Forward recovery [{self.corner_step}/{self.forward_duration}]")
             
             if self.corner_step >= self.forward_duration:
                 self.mode = 'FIND'
                 self.corner_phase = None
-                print("✅ Corner escape complete → Searching for wall")
+                print("  Corner escape complete → Searching for wall")
             
             return left, right
     
@@ -141,50 +144,49 @@ class SimpleWallFollower:
         side_avg, side_front, side_back = self.get_side_distance(dist)
         front_dist = self.get_front_distance(dist)
         
-        # === PRIORITY 1: Check for obstacles/corners (dead-ends) ===
+        # If we are in front of an obstacle AND not in corner mode, enter corner mode
         if front_dist < self.front_threshold:
             if self.mode != 'CORNER':
                 self.start_corner_escape()
         
-        # === CORNER MODE: Execute escape sequence ===
+        # Handle CORNER mode if in corner mode
         if self.mode == 'CORNER':
-            return self.handle_corner(dist)
+            return self.handle_corner()
         
-        # === FIND MODE: Look for wall ===
+        # Handle FIND mode if nothing to do
         if self.mode == 'FIND':
-            if side_avg is not None and side_avg < self.find_threshold:
+            if side_avg is not None and side_avg < self.find_threshold: # Wall detected
                 self.mode = 'FOLLOW'
                 self.integral_error = 0
                 self.last_error = 0
-                print(f"✅ Wall found at {side_avg:.2f}m → Starting FOLLOW mode")
+                print(f"  Wall found at {side_avg:.2f}m → Starting FOLLOW mode")
             else:
-                print(f"🔍 Searching for wall... (side: {side_avg}m if side_avg else 'none')")
+                print(f"  Searching for wall...")
                 return self.base_speed, self.base_speed
         
-        # === FOLLOW MODE: PID control ===
-        # Check if wall disappeared (opening/corner where wall ends)
+        # Handle FOLLOW mode with PID control
+
+        # In this case we are in FOLLOW but lost the wall... oposite of U turn!
         if side_avg is None or side_avg > 0.80:
             self.wall_lost_counter += 1
             
             # Wall just disappeared - turn towards it to follow around the corner!
-            if self.wall_lost_counter < 25:  # Keep turning for up to 25 steps
+            if self.wall_lost_counter < self.wall_lost_steps:  # How many steps do we turn till we give up?
                 self.turning_to_follow = True
-                print(f"↪️  Wall disappeared! Turning LEFT to follow it [{self.wall_lost_counter}/25]")
-                
-                # Turn toward the wall side (left if following left wall)
+                print(f"   Wall disappeared! Turning to follow it [{self.wall_lost_counter}/{self.wall_lost_steps}]")
+
+                # Parameters adjusted for smoother turning
                 if self.follow_side == 'left':
-                    # Turn left to follow the wall
                     left_speed = 0.22
                     right_speed = 0.45
                 else:
-                    # Turn right to follow the wall
                     left_speed = 0.45
                     right_speed = 0.22
                 
                 return left_speed, right_speed
             else:
                 # Turned for too long without finding wall - give up and search
-                print("⚠ Wall lost for too long → Back to FIND mode")
+                print("  Wall lost for too long → Back to FIND mode")
                 self.mode = 'FIND'
                 self.integral_error = 0
                 self.wall_lost_counter = 0
@@ -193,10 +195,12 @@ class SimpleWallFollower:
         else:
             # Wall is present - reset counters
             if self.wall_lost_counter > 0:
-                print(f"✅ Wall reacquired at {side_avg:.2f}m after turning!")
+                print(f"  Wall reacquired at {side_avg:.2f}m after turning!")
             self.wall_lost_counter = 0
             self.turning_to_follow = False
         
+
+        #PID control - start
         # Calculate errors
         distance_error = side_avg - self.target_dist
         
@@ -208,7 +212,6 @@ class SimpleWallFollower:
         
         # PID calculation
         self.integral_error += distance_error
-        # Anti-windup: limit integral
         self.integral_error = max(-0.5, min(0.5, self.integral_error))
         
         derivative_error = distance_error - self.last_error
@@ -221,7 +224,6 @@ class SimpleWallFollower:
         
         # Limit steering
         steering = max(-0.8, min(0.8, steering))
-        
         # Apply steering to wheel speeds
         forward = self.base_speed
         
@@ -240,7 +242,7 @@ class SimpleWallFollower:
         
         # Status output
         status = f"dist_err:{distance_error:+.3f} ang_err:{angle_error:+.3f} I:{self.integral_error:+.3f}"
-        print(f"📏 Wall: {side_avg:.2f}m | {status} | L:{left_speed:.2f} R:{right_speed:.2f}")
+        print(f"  Wall: {side_avg:.2f}m | {status} | L:{left_speed:.2f} R:{right_speed:.2f}")
         
         return left_speed, right_speed
 
@@ -253,17 +255,17 @@ def main(args=None):
     # Create wall follower - adjusted for closer following and gentler turns
     wf = SimpleWallFollower(
         base_speed=0.6,
-        follow_side='left',    # Follow left wall
-        target_dist=0.15,      # Stay 25cm from wall (closer!)
-        kp=2.0,                # Proportional gain
-        ki=0.05,               # Integral gain
-        kd=0.7,                # Derivative gain
-        find_threshold=0.50,   # Detect wall within 70cm
-        front_threshold=0.30   # Corner detection at 30cm
+        follow_side='left',
+        target_dist=0.15,
+        kp=2.0, 
+        ki=0.05,        
+        kd=0.7, 
+        find_threshold=0.50, 
+        front_threshold=0.30 
     )
     
     print("=" * 60)
-    print("🤖 SIMPLE PID WALL FOLLOWER (LEFT SIDE)")
+    print("  SIMPLE PID WALL FOLLOWER")
     print("=" * 60)
     
     iteration = 0

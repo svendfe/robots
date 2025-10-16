@@ -1,0 +1,245 @@
+\documentclass{article}
+
+
+
+% Language setting
+
+% Replace `english' with e.g. `spanish' to change the document language
+
+\usepackage[english]{babel}
+
+
+
+% Set page size and margins
+
+% Replace `letterpaper' with `a4paper' for UK/EU standard size
+
+\usepackage[letterpaper,top=2cm,bottom=2cm,left=3cm,right=3cm,marginparwidth=1.75cm]{geometry}
+
+
+
+% Useful packages
+
+\usepackage{amsmath}
+
+\usepackage{graphicx}
+
+\usepackage[colorlinks=true, allcolors=blue]{hyperref}
+
+
+
+\title{A1. Sistema básico de navegación}
+
+\author{Federico Arribas \\ J}
+
+
+
+\begin{document}
+
+\maketitle
+
+
+
+\section{Introduction}
+
+
+
+Memoria con explicaciones necesarias sobre el método utilizado para la programación del robot móvil Pioneer P3DX en el simulador Coppelia, de todas las decisiones de diseño tomadas y, especialmente, los resultados de las pruebas que se han realizado en los distintos escenarios junto con los parámetros. Incorpora un comentario crítico, y finalizar con unas conclusiones y unas propuestas de mejora o continuación del trabajo.
+
+EL trabajo ha sido generado por los participantes con la ayuda del asistentes de IA Claude
+
+
+
+\section{Explicación del Método}
+
+
+
+El método implementado para el control del robot móvil Pioneer P3DX es un Seguidor de Pared de Máquina de Estados, que utiliza un Controlador PID para mantener una distancia y orientación constantes con respecto a la pared lateral seleccionada (left o rigth).
+
+El sistema opera en tres modos o estados principales, que gestionan el comportamiento del robot en diferentes escenarios:
+
+
+
+\subsection{Estado FIND (Búsqueda):}
+
+
+
+\begin{itemize}
+
+    \item \textbf{Propósito}: Localizar la pared inicial cuando el robot comienza o después de perder la pared en un espacio abierto.
+
+    \item \textbf{Acción}: El robot avanza en línea recta a base\_speed.
+
+    \item \textbf{Transición}: Cambia a FOLLOW cuando uno o más sensores laterales detectan una pared dentro del umbral find\_threshold.
+
+\end{itemize}
+
+
+
+\subsection{Estado FOLLOW (Seguimiento):}
+
+\begin{itemize}
+
+    \item \textbf{Propósito}: Mantener la distancia deseada (target\_dist) y el ángulo paralelo a la pared.
+
+    \item \textbf{Acción}: Se utiliza un controlador PID para calcular la corrección de dirección (steering) basándose en dos tipos de error:
+
+
+
+    \begin{itemize}
+
+        \item \textit{Error de Distancia:} La diferencia entre la distancia lateral actual y la target\_dist.
+
+        \item \textit{Error de Ángulo:} La diferencia entre las lecturas de los sensores laterales frontal y trasero. Un error distinto de cero indica que el robot está girando hacia o alejándose de la pared. 
+
+        \item \textit{Gestión de Esquinas Abiertas:} Si la pared desaparece, el robot inicia un giro lento hacia el lado de seguimiento durante un número limitado de pasos (wall\_lost\_counter) para seguir la pared en la esquina.
+
+    \end{itemize}
+
+    \item \textbf{Transición}: Si el sensor frontal detecta un obstáculo cercano (front\_threshold), cambia a CORNER. Si pierde la pared por mucho tiempo, vuelve a FIND.
+
+\end{itemize}
+
+
+
+\subsection{Estado CORNER (Esquina Cerrada / Punto Muerto):}
+
+\begin{itemize}
+
+    \item \textbf{Propósito}: Evitar colisiones en esquinas cerradas (callejones sin salida) donde el robot choca con una pared frontal.
+
+    \item \textbf{Acción}: Ejecuta una secuencia de escape preprogramada (handle\_corner):
+
+    \begin{itemize}
+
+        \item \textit{Retroceso (back):} Retrocede brevemente. 
+
+        \item \textit{Giro (turn):} Gira 90 grados en dirección opuesta a la pared de seguimiento.
+
+        \item \textit{Avance (forward):} Avanza brevemente para despejar la esquina.
+
+    \end{itemize}
+
+    \item \textbf{Transición}: Al finalizar la secuencia, vuelve al estado FIND para comenzar a buscar la nueva pared
+
+\end{itemize}
+
+
+
+\section{Parámetros}
+
+Los parámetros de la clase SimpleWallFollower se seleccionaron mediante ajuste empírico (prueba y error en la simulación) para lograr un equilibrio entre velocidad y estabilidad. La Tabla 1 contiene los parametros que pueden ser ajustados al crear la clase, pero dentro de esta hay muchos mas como velocidades de retroceso en el estado CORNER o velocidades  de rotacion en el estado FOLLOW cuando tiene que gestionar esquinas abiertas. Estos parametros tambien han sido ajustados para funcionar de la mejor manera posible, pero no sentimos que necesiten ser ajustador por el usuario
+
+
+
+\begin{table}
+
+    \centering
+
+    \begin{tabular}{ccc}
+
+    \hline
+
+    \textbf{Parámetro} & \textbf{Valor} & \textbf{Descripción} \\ 
+
+    \hline
+
+        follow\_side & left & Se eligió el lado izquierdo para el seguimiento, pero rigth funciona igual de bien.\\
+
+        target\_dist& 0.15 & Distancia relativamente cercana para permitir maniobras en pasajes estrechos.\\ 
+
+        base\_speed & 0.6 &  Velocidad moderada para controlabilidad en las curvas. \\ 
+
+        kp& 2.0 &  Valor alto para una respuesta rápida al error de distancia.\\ 
+
+        ki & 0.05 & Valor bajo para evitar el sobreimpulso.\\ 
+
+        kd & 0.7 & Valor significativo para reaccionar rápidamente a los cambios en el ángulo\\ 
+
+        front\_threshold & 0.3 & Distancia de seguridad para detectar un punto muerto y activar el escape de esquina.\\ 
+
+        find\_threshold & 0.5 & Distancia a la que una pared ha sido encontrada para iniciar el seguimiento.\\ 
+
+    \end{tabular}
+
+    \caption{input parameters}
+
+    \label{tab:placeholder}
+
+\end{table}
+
+
+
+\section{Resultados}
+
+Como se puede observar en las figuras 1, 2 y 3,  el robot es capaz de moverse en mapas simples y complejos bordeando la pared de una manera eficiente. el controlador PID demuestra alta estabilidad.
+
+
+
+\section{Conclusiones y Propuestas de Mejora}
+
+El proyecto ha resultado en un Seguidor de Pared robusto y confiable que utiliza un control PID bien ajustado y una máquina de estados lógica.
+
+\begin{itemize}
+
+    \item El Control PID es eficaz para mantener la estabilidad en tramos rectos y curvos suaves, minimizando el error de distancia y ángulo.
+
+    \item La Máquina de Estados permite al robot autónomo manejar con éxito las tres situaciones críticas: búsqueda, seguimiento y evasión de esquinas cerradas
+
+\end{itemize}
+
+
+
+\subsection{Propuestas de mejora:}
+
+\begin{itemize}
+
+    \item \textbf{Uso de todos los sensores:} Actualmente solo se usan 4 de los 16 sensores que tiene el robot, se propone el use de todos ellos para tener un mejor entendimiento del albiente. Tambien se puede añadir la camara o otros sensores como lidar.
+
+    \item \textbf{Giro anticipado:} Actualemnete el robot cuando se encuentra una pared hace un giro brusco con retroceso, se podria añadir un giro anticipado para que pueda girar de una manera mas fluida
+
+    \item \textbf{Implementacion de algoritmo BUG:} Actualmente el robot simplemente da vueltas a la habitaciones, pero se podria implementar un algoritmo BUG para que se mueva con proposito
+
+\end{itemize}
+
+
+
+\begin{figure}
+
+    \centering
+
+    \includegraphics[width=0.5\linewidth]{mapa_complicado_1.png}
+
+    \caption{mapa complicado 1}
+
+    \label{fig:placeholder}
+
+\end{figure}
+
+\begin{figure}
+
+    \centering
+
+    \includegraphics[width=0.5\linewidth]{mapa_complicado_2.png}
+
+    \caption{mapa complicado 2}
+
+    \label{fig:placeholder}
+
+\end{figure}
+
+\begin{figure}
+
+    \centering
+
+    \includegraphics[width=0.5\linewidth]{Screenshot 2025-10-15 at 17.56.58.png}
+
+    \caption{mapa simple}
+
+    \label{fig:placeholder}
+
+\end{figure}
+
+
+
+\end{document}
