@@ -13,21 +13,20 @@ class ScanToMapLocalizer:
     """
     Scan-to-map ICP localization.
     
-    Instead of matching consecutive scans (which drifts), we match
-    each new scan against occupied cells in the map. This provides
-    a stable global reference and reduces drift.
+    Matches each new scan against occupied cells in the map.
+    Does NOT rely on odometry at all - uses multi-hypothesis search.
     """
     
     def __init__(self):
         self.current_pose = [0.0, 0.0, 0.0]  # x, y, theta
-        self.map_points = None  # Cached map points for matching
+        self.map_points = None
         self.map_update_counter = 0
-        self.last_odom = None  # Track odometry changes for motion estimate
+        self.last_scan_points = None
         
         # ICP parameters
-        self.max_iterations = 25
+        self.max_iterations = 20
         self.convergence_threshold = 1e-4
-        self.max_correspondence_dist = 0.3
+        self.max_correspondence_dist = 0.25
         
     def extract_scan_points(self, lidar_local_points, min_range=0.15, max_range=4.0):
         """Extract valid 2D points from lidar scan."""
@@ -43,19 +42,14 @@ class ScanToMapLocalizer:
         
         return np.column_stack([x[valid_mask], y[valid_mask]])
     
-    def extract_map_points(self, occupancy_map, subsample=3):
+    def extract_map_points(self, occupancy_map):
         """Extract occupied cells from map as point cloud."""
-        # Get probability grid
         prob = 1.0 / (1.0 + np.exp(-occupancy_map.log_odds))
-        
-        # Find occupied cells (high probability)
         occupied = np.where(prob > 0.7)
         
         if len(occupied[0]) == 0:
             return None
         
-        # Convert grid coords to world coords
-        # Grid: (row=y, col=x), center offset
         grid_y = occupied[0]
         grid_x = occupied[1]
         
@@ -65,8 +59,8 @@ class ScanToMapLocalizer:
         points = np.column_stack([world_x, world_y])
         
         # Subsample for speed
-        if len(points) > 500:
-            indices = np.random.choice(len(points), min(500, len(points)), replace=False)
+        if len(points) > 800:
+            indices = np.random.choice(len(points), 800, replace=False)
             points = points[indices]
         
         return points
@@ -84,28 +78,36 @@ class ScanToMapLocalizer:
         
         return np.column_stack([global_x, global_y])
     
+    def compute_scan_match_score(self, scan_local, map_points, pose):
+        """Compute how well a scan matches the map at given pose."""
+        if map_points is None or len(map_points) < 10:
+            return float('inf')
+        
+        scan_global = self.transform_to_global(scan_local, pose[0], pose[1], pose[2])
+        tree = KDTree(map_points)
+        distances, _ = tree.query(scan_global, k=1)
+        
+        # Use trimmed mean to be robust to outliers
+        distances = np.sort(distances)
+        n_use = int(len(distances) * 0.8)  # Use 80% closest
+        if n_use < 10:
+            return float('inf')
+        
+        return np.mean(distances[:n_use])
+    
     def icp_refine(self, scan_local, map_points, initial_pose):
-        """
-        Refine pose using ICP between scan and map.
-        Returns refined (x, y, theta).
-        """
+        """Refine pose using ICP between scan and map."""
         if map_points is None or len(map_points) < 20 or len(scan_local) < 20:
             return initial_pose
         
         x, y, theta = initial_pose
         prev_error = float('inf')
-        
-        # Build KD-tree for map points
         tree = KDTree(map_points)
         
         for iteration in range(self.max_iterations):
-            # Transform scan to global using current pose estimate
             scan_global = self.transform_to_global(scan_local, x, y, theta)
-            
-            # Find correspondences
             distances, indices = tree.query(scan_global, k=1)
             
-            # Filter by distance
             valid = distances < self.max_correspondence_dist
             if np.sum(valid) < 15:
                 break
@@ -113,13 +115,11 @@ class ScanToMapLocalizer:
             scan_matched = scan_global[valid]
             map_matched = map_points[indices[valid]]
             
-            # Check convergence
             mean_error = np.mean(distances[valid])
             if iteration > 0 and abs(prev_error - mean_error) < self.convergence_threshold:
                 break
             prev_error = mean_error
             
-            # Compute optimal transformation using SVD
             scan_centroid = np.mean(scan_matched, axis=0)
             map_centroid = np.mean(map_matched, axis=0)
             
@@ -135,12 +135,10 @@ class ScanToMapLocalizer:
                 R = Vt.T @ U.T
             
             t = map_centroid - R @ scan_centroid
-            
-            # Extract incremental correction
             dtheta = np.arctan2(R[1, 0], R[0, 0])
             
-            # Apply correction (small steps to avoid overshooting)
-            alpha = 0.5  # Damping factor
+            # Apply correction with damping
+            alpha = 0.6
             x += alpha * t[0]
             y += alpha * t[1]
             theta += alpha * dtheta
@@ -153,78 +151,111 @@ class ScanToMapLocalizer:
         
         return (x, y, theta)
     
-    def update(self, lidar_local_points, occupancy_map, odom_x, odom_y, odom_theta):
-        """
-        Update pose estimate using scan-to-map matching.
+    def scan_to_scan_motion(self, current_scan, last_scan):
+        """Estimate motion between two scans using ICP."""
+        if last_scan is None or len(last_scan) < 30 or len(current_scan) < 30:
+            return 0.0, 0.0, 0.0
         
-        Args:
-            lidar_local_points: Current scan in robot frame
-            occupancy_map: The OccupancyMap object
-            odom_x, odom_y, odom_theta: Current odometry (used for motion delta)
+        # Build KD-tree for last scan (target)
+        tree = KDTree(last_scan)
         
-        Returns: (x, y, theta) estimated pose
-        """
+        dx, dy, dtheta = 0.0, 0.0, 0.0
+        current_transformed = current_scan.copy()
+        
+        for _ in range(15):
+            distances, indices = tree.query(current_transformed, k=1)
+            valid = distances < 0.5
+            if np.sum(valid) < 20:
+                break
+            
+            src = current_transformed[valid]
+            tgt = last_scan[indices[valid]]
+            
+            src_c = np.mean(src, axis=0)
+            tgt_c = np.mean(tgt, axis=0)
+            
+            H = (src - src_c).T @ (tgt - tgt_c)
+            U, _, Vt = np.linalg.svd(H)
+            R = Vt.T @ U.T
+            if np.linalg.det(R) < 0:
+                Vt[-1, :] *= -1
+                R = Vt.T @ U.T
+            
+            t = tgt_c - R @ src_c
+            ddtheta = np.arctan2(R[1, 0], R[0, 0])
+            
+            cos_t = np.cos(dtheta)
+            sin_t = np.sin(dtheta)
+            dx += cos_t * t[0] - sin_t * t[1]
+            dy += sin_t * t[0] + cos_t * t[1]
+            dtheta += ddtheta
+            
+            # Transform current scan
+            cos_d = np.cos(dtheta)
+            sin_d = np.sin(dtheta)
+            current_transformed = np.column_stack([
+                current_scan[:, 0] * cos_d - current_scan[:, 1] * sin_d + dx,
+                current_scan[:, 0] * sin_d + current_scan[:, 1] * cos_d + dy
+            ])
+        
+        # ICP gives us T such that T(current) ≈ last
+        # If current scan moved +dx to match last, walls moved +dx, so robot moved -dx
+        return -dx, -dy, -dtheta
+    
+    def update(self, lidar_local_points, occupancy_map, odom_x=0, odom_y=0, odom_theta=0):
+        """Update pose estimate using scan-to-scan + scan-to-map matching."""
         scan_local = self.extract_scan_points(lidar_local_points)
         
         if len(scan_local) < 30:
             return tuple(self.current_pose)
         
-        # Calculate motion delta from odometry (even if broken, gives direction)
-        if self.last_odom is not None:
-            # Delta in odometry frame
-            odom_dx = odom_x - self.last_odom[0]
-            odom_dy = odom_y - self.last_odom[1]
-            odom_dtheta = odom_theta - self.last_odom[2]
-            
-            # Scale factor to compensate for broken odometry (tunable)
-            # Based on earlier observation: odom shows 1m when robot travels 8m
-            scale = 8.0
-            odom_dx *= scale
-            odom_dy *= scale
-            
-            # Transform motion to global frame using current pose heading
-            cos_t = np.cos(self.current_pose[2])
-            sin_t = np.sin(self.current_pose[2])
-            global_dx = cos_t * odom_dx - sin_t * odom_dy
-            global_dy = sin_t * odom_dx + cos_t * odom_dy
-            
-            # Initial guess: previous pose + scaled odometry motion
-            init_x = self.current_pose[0] + global_dx
-            init_y = self.current_pose[1] + global_dy
-            init_theta = self.current_pose[2] + odom_dtheta
-        else:
-            # First frame - use current pose
-            init_x, init_y, init_theta = self.current_pose
+        # Step 1: Estimate motion from scan-to-scan ICP
+        motion_dx, motion_dy, motion_dtheta = self.scan_to_scan_motion(
+            scan_local, self.last_scan_points
+        )
         
-        # Update last odometry
-        self.last_odom = (odom_x, odom_y, odom_theta)
+        # Transform local motion to global
+        cos_t = np.cos(self.current_pose[2])
+        sin_t = np.sin(self.current_pose[2])
+        global_dx = cos_t * motion_dx - sin_t * motion_dy
+        global_dy = sin_t * motion_dx + cos_t * motion_dy
         
-        # Update map points cache periodically
+        # Initial guess from scan-to-scan motion
+        init_x = self.current_pose[0] + global_dx
+        init_y = self.current_pose[1] + global_dy
+        init_theta = self.current_pose[2] + motion_dtheta
+        
+        # Save current scan for next iteration
+        self.last_scan_points = scan_local
+        
+        # Update map points cache
         self.map_update_counter += 1
         if self.map_points is None or self.map_update_counter % 5 == 0:
             self.map_points = self.extract_map_points(occupancy_map)
         
-        # If we don't have enough map yet, just use the motion estimate
-        if self.map_points is None or len(self.map_points) < 50:
+        # If not enough map yet, use scan-to-scan estimate
+        if self.map_points is None or len(self.map_points) < 100:
             self.current_pose = [init_x, init_y, init_theta]
-            # Normalize angle
             while self.current_pose[2] > np.pi:
                 self.current_pose[2] -= 2 * np.pi
             while self.current_pose[2] < -np.pi:
                 self.current_pose[2] += 2 * np.pi
             return tuple(self.current_pose)
         
-        # Refine pose using ICP against map
+        # Step 2: Refine with scan-to-map ICP
         refined = self.icp_refine(scan_local, self.map_points, (init_x, init_y, init_theta))
         
-        # Sanity check: don't allow huge jumps from previous pose
+        # Sanity check
         dx = refined[0] - self.current_pose[0]
         dy = refined[1] - self.current_pose[1]
         jump = np.sqrt(dx**2 + dy**2)
         
-        if jump > 0.5:  # More than 0.5m jump is suspicious
-            # Fall back to motion estimate only
-            self.current_pose = [init_x, init_y, init_theta]
+        if jump > 0.3:  # Limit to 0.3m per frame
+            # Scale down the jump
+            scale = 0.3 / jump
+            self.current_pose[0] += dx * scale
+            self.current_pose[1] += dy * scale
+            self.current_pose[2] = refined[2]
         else:
             self.current_pose = list(refined)
         
@@ -241,7 +272,7 @@ class ScanToMapLocalizer:
     
     def set_pose(self, x, y, theta):
         self.current_pose = [x, y, theta]
-        self.last_odom = None  # Reset odometry tracking
+        self.last_scan_points = None
 
 
 class SimpleWallFollower:
