@@ -9,6 +9,231 @@ from collections import deque
 import copy
 
 
+class ICPScanMatcher:
+    """
+    Iterative Closest Point algorithm for scan matching.
+    Aligns current scan to previous scan to correct odometry drift.
+    """
+    
+    def __init__(self, max_iterations=50, tolerance=1e-5, max_correspondence_dist=0.5):
+        self.max_iterations = max_iterations
+        self.tolerance = tolerance
+        self.max_correspondence_dist = max_correspondence_dist
+        self.last_scan_points = None
+        
+    def extract_points_from_scan(self, lidar_local_points, min_range=0.1, max_range=5.0):
+        """
+        Extract valid 2D points from lidar scan data.
+        """
+        if len(lidar_local_points) == 0:
+            return np.array([]).reshape(0, 2)
+        
+        data = np.array(lidar_local_points).reshape(-1, 3)
+        x = data[:, 0]
+        y = data[:, 1]
+        
+        # Filter by range
+        distances = np.sqrt(x**2 + y**2)
+        valid_mask = (distances > min_range) & (distances < max_range)
+        
+        points = np.column_stack([x[valid_mask], y[valid_mask]])
+        return points
+    
+    def transform_points(self, points, dx, dy, dtheta):
+        """
+        Apply a 2D rigid transformation to points.
+        """
+        if len(points) == 0:
+            return points
+        
+        cos_t = np.cos(dtheta)
+        sin_t = np.sin(dtheta)
+        
+        # Rotation matrix
+        R = np.array([[cos_t, -sin_t],
+                      [sin_t, cos_t]])
+        
+        # Apply rotation then translation
+        rotated = points @ R.T
+        transformed = rotated + np.array([dx, dy])
+        
+        return transformed
+    
+    def find_correspondences(self, source_points, target_points):
+        """
+        Find nearest neighbors between source and target point clouds.
+        Returns matched pairs and distances.
+        """
+        if len(source_points) == 0 or len(target_points) == 0:
+            return np.array([]), np.array([]), np.array([])
+        
+        tree = KDTree(target_points)
+        distances, indices = tree.query(source_points, k=1)
+        
+        # Filter by maximum correspondence distance
+        valid_mask = distances < self.max_correspondence_dist
+        
+        valid_source = source_points[valid_mask]
+        valid_target = target_points[indices[valid_mask]]
+        valid_distances = distances[valid_mask]
+        
+        return valid_source, valid_target, valid_distances
+    
+    def compute_transform(self, source_points, target_points):
+        """
+        Compute optimal rigid transformation (R, t) that aligns source to target.
+        Uses SVD-based least squares solution.
+        """
+        if len(source_points) < 3 or len(target_points) < 3:
+            return 0.0, 0.0, 0.0
+        
+        # Compute centroids
+        centroid_source = np.mean(source_points, axis=0)
+        centroid_target = np.mean(target_points, axis=0)
+        
+        # Center the points
+        source_centered = source_points - centroid_source
+        target_centered = target_points - centroid_target
+        
+        # Compute cross-covariance matrix
+        H = source_centered.T @ target_centered
+        
+        # SVD
+        U, S, Vt = np.linalg.svd(H)
+        
+        # Compute rotation
+        R = Vt.T @ U.T
+        
+        # Handle reflection case
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+        
+        # Compute translation
+        t = centroid_target - R @ centroid_source
+        
+        # Extract angle from rotation matrix
+        dtheta = np.arctan2(R[1, 0], R[0, 0])
+        dx = t[0]
+        dy = t[1]
+        
+        return dx, dy, dtheta
+    
+    def icp(self, source_points, target_points, initial_guess=(0, 0, 0)):
+        """
+        Run ICP algorithm to align source to target.
+        
+        Args:
+            source_points: Current scan points (Nx2)
+            target_points: Previous scan points (Nx2)  
+            initial_guess: Initial (dx, dy, dtheta) estimate from odometry
+            
+        Returns:
+            (dx, dy, dtheta): Refined transformation
+            converged: Whether ICP converged
+            error: Final mean squared error
+        """
+        if len(source_points) < 10 or len(target_points) < 10:
+            return initial_guess, False, float('inf')
+        
+        # Apply initial guess
+        dx, dy, dtheta = initial_guess
+        current_source = self.transform_points(source_points, dx, dy, dtheta)
+        
+        prev_error = float('inf')
+        
+        for iteration in range(self.max_iterations):
+            # Find correspondences
+            matched_source, matched_target, distances = self.find_correspondences(
+                current_source, target_points
+            )
+            
+            if len(matched_source) < 10:
+                return (dx, dy, dtheta), False, prev_error
+            
+            # Compute error
+            current_error = np.mean(distances**2)
+            
+            # Check convergence
+            if abs(prev_error - current_error) < self.tolerance:
+                return (dx, dy, dtheta), True, current_error
+            
+            prev_error = current_error
+            
+            # Compute incremental transform
+            ddx, ddy, ddtheta = self.compute_transform(matched_source, matched_target)
+            
+            # Update cumulative transform
+            # Compose transformations properly
+            cos_t = np.cos(dtheta)
+            sin_t = np.sin(dtheta)
+            
+            new_dx = dx + cos_t * ddx - sin_t * ddy
+            new_dy = dy + sin_t * ddx + cos_t * ddy
+            new_dtheta = dtheta + ddtheta
+            
+            # Normalize angle
+            while new_dtheta > np.pi:
+                new_dtheta -= 2 * np.pi
+            while new_dtheta < -np.pi:
+                new_dtheta += 2 * np.pi
+            
+            dx, dy, dtheta = new_dx, new_dy, new_dtheta
+            
+            # Apply updated transform to original source
+            current_source = self.transform_points(source_points, dx, dy, dtheta)
+        
+        return (dx, dy, dtheta), False, prev_error
+    
+    def match_scan(self, current_scan, odom_delta):
+        """
+        Main interface: match current scan against previous scan.
+        
+        Args:
+            current_scan: Current lidar points (local frame)
+            odom_delta: (dx, dy, dtheta) from odometry since last scan
+            
+        Returns:
+            corrected_delta: Refined (dx, dy, dtheta)
+            correction: How much ICP corrected the odometry
+        """
+        current_points = self.extract_points_from_scan(current_scan)
+        
+        if self.last_scan_points is None or len(self.last_scan_points) < 10:
+            self.last_scan_points = current_points
+            return odom_delta, (0, 0, 0)
+        
+        # Run ICP to refine odometry estimate
+        refined_delta, converged, error = self.icp(
+            current_points, 
+            self.last_scan_points,
+            initial_guess=odom_delta
+        )
+        
+        # Calculate correction
+        correction = (
+            refined_delta[0] - odom_delta[0],
+            refined_delta[1] - odom_delta[1],
+            refined_delta[2] - odom_delta[2]
+        )
+        
+        # Update last scan for next iteration
+        self.last_scan_points = current_points
+        
+        # If ICP didn't converge well, trust odometry more
+        if not converged or error > 0.1:
+            # Blend between odometry and ICP (trust odometry 70%, ICP 30%)
+            alpha = 0.3
+            blended_delta = (
+                odom_delta[0] + alpha * correction[0],
+                odom_delta[1] + alpha * correction[1],
+                odom_delta[2] + alpha * correction[2]
+            )
+            return blended_delta, correction
+        
+        return refined_delta, correction
+
+
 class SimpleWallFollower:
     """Wall following controller - unchanged"""
     
@@ -444,7 +669,7 @@ class OccupancyMap:
 
 
 class SLAMWithLoopClosure:
-    """Full SLAM system with loop closure"""
+    """Full SLAM system with loop closure and ICP scan matching"""
     
     def __init__(self, initial_pose=(0, 0, 0)):
         self.mapper = OccupancyMap(size_meters=20, resolution=0.1)
@@ -455,23 +680,86 @@ class SLAMWithLoopClosure:
         )
         self.optimizer = PoseGraphOptimizer()
         
+        # ICP scan matcher for drift correction
+        self.scan_matcher = ICPScanMatcher(
+            max_iterations=50,
+            tolerance=1e-5,
+            max_correspondence_dist=0.5
+        )
+        
         # Pose graph
         self.pose_graph = []
-        self.current_pose = list(initial_pose)
+        self.current_pose = list(initial_pose)  # Corrected pose
+        
+        # Track previous odometry for computing deltas
+        self.prev_odom = None
         
         # Statistics
         self.loop_closures_detected = 0
         self.last_optimization_time = 0
+        self.total_icp_correction = [0.0, 0.0, 0.0]  # Cumulative correction stats
         
     def update(self, lidar_local_points, odom_x, odom_y, odom_theta):
-        """Main SLAM update with loop closure"""
+        """Main SLAM update with ICP scan matching and loop closure"""
         
-        # Create new pose node
+        # Compute odometry delta (motion since last update)
+        if self.prev_odom is None:
+            odom_delta = (0.0, 0.0, 0.0)
+        else:
+            # Compute relative motion in previous frame
+            dx_global = odom_x - self.prev_odom[0]
+            dy_global = odom_y - self.prev_odom[1]
+            dtheta = odom_theta - self.prev_odom[2]
+            
+            # Transform to local frame of previous pose
+            prev_theta = self.prev_odom[2]
+            cos_t = np.cos(-prev_theta)
+            sin_t = np.sin(-prev_theta)
+            
+            dx_local = cos_t * dx_global - sin_t * dy_global
+            dy_local = sin_t * dx_global + cos_t * dy_global
+            
+            odom_delta = (dx_local, dy_local, dtheta)
+        
+        # Use ICP to refine the motion estimate
+        corrected_delta, icp_correction = self.scan_matcher.match_scan(
+            lidar_local_points, odom_delta
+        )
+        
+        # Track cumulative correction for statistics
+        self.total_icp_correction[0] += abs(icp_correction[0])
+        self.total_icp_correction[1] += abs(icp_correction[1])
+        self.total_icp_correction[2] += abs(icp_correction[2])
+        
+        # Apply corrected delta to current pose
+        if self.prev_odom is not None:
+            # Transform corrected delta back to global frame
+            current_theta = self.current_pose[2]
+            cos_t = np.cos(current_theta)
+            sin_t = np.sin(current_theta)
+            
+            dx_global = cos_t * corrected_delta[0] - sin_t * corrected_delta[1]
+            dy_global = sin_t * corrected_delta[0] + cos_t * corrected_delta[1]
+            
+            self.current_pose[0] += dx_global
+            self.current_pose[1] += dy_global
+            self.current_pose[2] += corrected_delta[2]
+            
+            # Normalize angle
+            while self.current_pose[2] > np.pi:
+                self.current_pose[2] -= 2 * np.pi
+            while self.current_pose[2] < -np.pi:
+                self.current_pose[2] += 2 * np.pi
+        
+        # Store current odometry for next delta computation
+        self.prev_odom = (odom_x, odom_y, odom_theta)
+        
+        # Create new pose node with CORRECTED pose (not raw odometry)
         node = PoseNode(
             idx=len(self.pose_graph),
-            x=odom_x,
-            y=odom_y,
-            theta=odom_theta,
+            x=self.current_pose[0],
+            y=self.current_pose[1],
+            theta=self.current_pose[2],
             scan=copy.deepcopy(lidar_local_points)
         )
         
@@ -558,17 +846,18 @@ def main(args=None):
     
     iteration = 0
     print("\n" + "="*70)
-    print("FULL SLAM WITH LOOP CLOSURE (CONSERVATIVE MODE)")
+    print("FULL SLAM WITH ICP SCAN MATCHING & LOOP CLOSURE")
     print("="*70)
     print("This system will:")
-    print("  ✓ Build a pose graph of robot trajectory")
+    print("  ✓ Use ICP scan matching to correct odometry drift in real-time")
+    print("  ✓ Build a pose graph with corrected robot poses")
     print("  ✓ Detect when robot returns to known locations")
     print("  ✓ Use STRICT criteria to avoid false positives:")
-    print("    - Distance < 0.5m (was 1.0m)")
-    print("    - Similarity > 85% (was 65%)")
-    print("    - Time gap > 100 frames (was 50)")
+    print("    - Distance < 0.5m")
+    print("    - Similarity > 85%")
+    print("    - Time gap > 100 frames")
     print("  ✓ Optimize trajectory and rebuild map on true loops")
-    print("\nWatch for 🔄 LOOP CLOSURE messages (should be rare!)\n")
+    print("\nICP will reduce drift during turns!\n")
     
     while coppelia.is_running():
         robot.update_odometry()
@@ -613,8 +902,10 @@ def main(args=None):
         robot.set_speed(left_speed, right_speed)
         
         if iteration % 50 == 0:
+            icp_corr = slam.total_icp_correction
             print(f"Iter {iteration:04d} | Poses: {len(slam.pose_graph):04d} | "
-                  f"Loop Closures: {slam.loop_closures_detected}")
+                  f"Loops: {slam.loop_closures_detected} | "
+                  f"ICP corr: ({icp_corr[0]:.3f}, {icp_corr[1]:.3f}, {icp_corr[2]:.2f}rad)")
         
         iteration += 1
         time.sleep(0.05)
@@ -627,7 +918,12 @@ def main(args=None):
     print(f"Total iterations: {iteration}")
     print(f"Pose graph nodes: {len(slam.pose_graph)}")
     print(f"Loop closures detected: {slam.loop_closures_detected}")
+    print(f"\nICP Cumulative Corrections:")
+    print(f"  X: {slam.total_icp_correction[0]:.3f}m")
+    print(f"  Y: {slam.total_icp_correction[1]:.3f}m")
+    print(f"  Theta: {slam.total_icp_correction[2]:.3f}rad ({np.degrees(slam.total_icp_correction[2]):.1f}°)")
     print(f"\n{'✓' if slam.loop_closures_detected > 0 else '✗'} Loop closure {'ACTIVE' if slam.loop_closures_detected > 0 else 'not triggered'}")
+    print(f"{'✓'} ICP scan matching was active throughout")
 
 
 if __name__ == "__main__":
