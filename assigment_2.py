@@ -9,38 +9,24 @@ from collections import deque
 import copy
 
 
-class ScanToMapMatcher:
+class ScanMatchingLocalizer:
     """
-    Scan-to-Map matching for drift correction.
+    Pure scan-to-scan ICP for motion estimation.
     
-    Key insight: Instead of matching scan-to-scan (which accumulates drift),
-    we match the current scan against the existing map. The map is our 
-    "ground truth" reference that doesn't drift.
-    
-    For angles: We trust odometry more for rotation (it's usually more accurate)
-    and focus ICP on correcting translation errors.
+    Since odometry is broken, we estimate robot motion by comparing
+    consecutive lidar scans using ICP (Iterative Closest Point).
     """
     
-    def __init__(self, map_reference=None):
-        self.map_reference = map_reference  # Will be set to OccupancyMap
-        self.last_scan = None
-        self.frame_count = 0
+    def __init__(self):
+        self.last_scan_points = None
+        self.current_pose = [0.0, 0.0, 0.0]  # x, y, theta
         
-        # Trust parameters
-        self.translation_correction_weight = 0.7  # How much to trust scan matching for XY
-        self.rotation_correction_weight = 0.3     # How much to trust scan matching for theta (less!)
+        # ICP parameters
+        self.max_iterations = 30
+        self.convergence_threshold = 1e-5
+        self.max_correspondence_dist = 0.5
         
-        # Matching parameters  
-        self.search_window_xy = 0.15    # Search ±15cm
-        self.search_window_theta = 0.1  # Search ±0.1 rad (~6 degrees)
-        self.search_resolution_xy = 0.03  # 3cm steps
-        self.search_resolution_theta = 0.02  # ~1 degree steps
-    
-    def set_map_reference(self, occupancy_map):
-        """Set the occupancy map to match against."""
-        self.map_reference = occupancy_map
-    
-    def extract_points(self, lidar_local_points, min_range=0.15, max_range=4.0):
+    def extract_points(self, lidar_local_points, min_range=0.15, max_range=5.0):
         """Extract valid 2D points from lidar scan."""
         if len(lidar_local_points) == 0:
             return np.array([]).reshape(0, 2)
@@ -54,145 +40,140 @@ class ScanToMapMatcher:
         
         return np.column_stack([x[valid_mask], y[valid_mask]])
     
-    def transform_to_global(self, local_points, robot_x, robot_y, robot_theta):
-        """Transform local scan points to global frame."""
-        if len(local_points) == 0:
-            return local_points
+    def transform_points(self, points, dx, dy, dtheta):
+        """Apply rigid transformation to points."""
+        if len(points) == 0:
+            return points
         
-        cos_t = np.cos(robot_theta)
-        sin_t = np.sin(robot_theta)
+        cos_t = np.cos(dtheta)
+        sin_t = np.sin(dtheta)
         
-        global_x = local_points[:, 0] * cos_t - local_points[:, 1] * sin_t + robot_x
-        global_y = local_points[:, 0] * sin_t + local_points[:, 1] * cos_t + robot_y
+        rotated_x = points[:, 0] * cos_t - points[:, 1] * sin_t
+        rotated_y = points[:, 0] * sin_t + points[:, 1] * cos_t
         
-        return np.column_stack([global_x, global_y])
+        return np.column_stack([rotated_x + dx, rotated_y + dy])
     
-    def compute_map_score(self, global_points):
+    def icp(self, source, target):
         """
-        Score how well the scan points match the existing map.
-        Higher score = better match (points land on occupied cells).
+        ICP to find transformation from source to target.
+        Returns (dx, dy, dtheta) that transforms source to align with target.
         """
-        if self.map_reference is None or len(global_points) == 0:
-            return 0.0
+        if len(source) < 10 or len(target) < 10:
+            return 0.0, 0.0, 0.0, False
         
-        mapper = self.map_reference
-        gx, gy = mapper.world_to_grid(global_points[:, 0], global_points[:, 1])
+        # Build KD-tree for target
+        tree = KDTree(target)
         
-        # Check bounds
-        valid = (gx >= 0) & (gx < mapper.grid_size) & (gy >= 0) & (gy < mapper.grid_size)
-        gx = gx[valid]
-        gy = gy[valid]
+        # Current transform estimate
+        dx, dy, dtheta = 0.0, 0.0, 0.0
+        current_source = source.copy()
         
-        if len(gx) == 0:
-            return 0.0
+        prev_error = float('inf')
         
-        # Score based on log-odds (positive = occupied)
-        scores = mapper.log_odds[gy, gx]
+        for _ in range(self.max_iterations):
+            # Find correspondences
+            distances, indices = tree.query(current_source, k=1)
+            
+            # Filter by distance
+            valid = distances < self.max_correspondence_dist
+            if np.sum(valid) < 10:
+                return dx, dy, dtheta, False
+            
+            src_matched = current_source[valid]
+            tgt_matched = target[indices[valid]]
+            
+            # Compute error
+            error = np.mean(distances[valid]**2)
+            if abs(prev_error - error) < self.convergence_threshold:
+                return dx, dy, dtheta, True
+            prev_error = error
+            
+            # Compute optimal transformation using SVD
+            src_centroid = np.mean(src_matched, axis=0)
+            tgt_centroid = np.mean(tgt_matched, axis=0)
+            
+            src_centered = src_matched - src_centroid
+            tgt_centered = tgt_matched - tgt_centroid
+            
+            H = src_centered.T @ tgt_centered
+            U, _, Vt = np.linalg.svd(H)
+            R = Vt.T @ U.T
+            
+            if np.linalg.det(R) < 0:
+                Vt[-1, :] *= -1
+                R = Vt.T @ U.T
+            
+            t = tgt_centroid - R @ src_centroid
+            
+            # Extract incremental transform
+            ddtheta = np.arctan2(R[1, 0], R[0, 0])
+            ddx, ddy = t[0], t[1]
+            
+            # Compose with current transform
+            cos_t = np.cos(dtheta)
+            sin_t = np.sin(dtheta)
+            dx += cos_t * ddx - sin_t * ddy
+            dy += sin_t * ddx + cos_t * ddy
+            dtheta += ddtheta
+            
+            # Update source points
+            current_source = self.transform_points(source, dx, dy, dtheta)
         
-        # Count how many points hit occupied cells
-        occupied_hits = np.sum(scores > 1.0)  # Strong occupied evidence
-        free_hits = np.sum(scores < -1.0)     # Strong free evidence (bad!)
-        
-        # Score: reward occupied hits, penalize free hits
-        score = occupied_hits - 2.0 * free_hits
-        
-        return score / len(global_points)  # Normalize
+        return dx, dy, dtheta, False
     
-    def search_best_pose(self, local_points, initial_x, initial_y, initial_theta):
+    def update(self, lidar_local_points):
         """
-        Search for the pose that best aligns scan with map.
-        Uses a coarse grid search around the initial estimate.
+        Update pose estimate using scan matching.
+        Returns current estimated pose (x, y, theta).
         """
-        best_score = -float('inf')
-        best_pose = (initial_x, initial_y, initial_theta)
+        current_points = self.extract_points(lidar_local_points)
         
-        # Generate search grid
-        dx_range = np.arange(-self.search_window_xy, self.search_window_xy + 0.001, 
-                            self.search_resolution_xy)
-        dy_range = np.arange(-self.search_window_xy, self.search_window_xy + 0.001,
-                            self.search_resolution_xy)
-        dtheta_range = np.arange(-self.search_window_theta, self.search_window_theta + 0.001,
-                                 self.search_resolution_theta)
+        if len(current_points) < 20:
+            return tuple(self.current_pose)
         
-        for dx in dx_range:
-            for dy in dy_range:
-                for dtheta in dtheta_range:
-                    test_x = initial_x + dx
-                    test_y = initial_y + dy  
-                    test_theta = initial_theta + dtheta
-                    
-                    global_points = self.transform_to_global(local_points, test_x, test_y, test_theta)
-                    score = self.compute_map_score(global_points)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_pose = (test_x, test_y, test_theta)
+        if self.last_scan_points is None or len(self.last_scan_points) < 20:
+            self.last_scan_points = current_points
+            return tuple(self.current_pose)
         
-        return best_pose, best_score
+        # Use ICP to find motion from last scan to current scan
+        # We want to find transform T such that T(current) ≈ last
+        # This gives us the INVERSE of robot motion
+        dx, dy, dtheta, converged = self.icp(current_points, self.last_scan_points)
+        
+        # The robot moved in the opposite direction
+        # (if current scan moved +dx to match last, robot moved -dx)
+        robot_dx = -dx
+        robot_dy = -dy  
+        robot_dtheta = -dtheta
+        
+        # Transform local motion to global frame
+        cos_t = np.cos(self.current_pose[2])
+        sin_t = np.sin(self.current_pose[2])
+        
+        global_dx = cos_t * robot_dx - sin_t * robot_dy
+        global_dy = sin_t * robot_dx + cos_t * robot_dy
+        
+        # Update pose
+        self.current_pose[0] += global_dx
+        self.current_pose[1] += global_dy
+        self.current_pose[2] += robot_dtheta
+        
+        # Normalize angle
+        while self.current_pose[2] > np.pi:
+            self.current_pose[2] -= 2 * np.pi
+        while self.current_pose[2] < -np.pi:
+            self.current_pose[2] += 2 * np.pi
+        
+        # Update last scan
+        self.last_scan_points = current_points
+        
+        return tuple(self.current_pose)
     
-    def match_scan(self, current_scan, odom_delta, current_global_pose):
-        """
-        Main interface: correct pose using scan-to-map matching.
-        
-        Strategy:
-        1. Trust odometry for angle (mostly)
-        2. Use scan-to-map to correct translation
-        3. Only do small angular corrections
-        """
-        self.frame_count += 1
-        local_points = self.extract_points(current_scan)
-        
-        if len(local_points) < 20:
-            return odom_delta, (0, 0, 0)
-        
-        # Skip first few frames (map not built yet)
-        if self.frame_count < 30:
-            self.last_scan = local_points
-            return odom_delta, (0, 0, 0)
-        
-        # Skip if map reference not set
-        if self.map_reference is None:
-            return odom_delta, (0, 0, 0)
-        
-        # Current pose estimate from odometry
-        est_x, est_y, est_theta = current_global_pose
-        
-        # Search for better pose
-        best_pose, score = self.search_best_pose(local_points, est_x, est_y, est_theta)
-        
-        # Only apply correction if we found a good match
-        if score < 0.1:  # Poor match, trust odometry
-            self.last_scan = local_points
-            return odom_delta, (0, 0, 0)
-        
-        # Compute correction
-        dx_correction = best_pose[0] - est_x
-        dy_correction = best_pose[1] - est_y
-        dtheta_correction = best_pose[2] - est_theta
-        
-        # Normalize angle correction
-        while dtheta_correction > np.pi:
-            dtheta_correction -= 2 * np.pi
-        while dtheta_correction < -np.pi:
-            dtheta_correction += 2 * np.pi
-        
-        # Apply weighted correction (trust odometry angles more)
-        weighted_dx = dx_correction * self.translation_correction_weight
-        weighted_dy = dy_correction * self.translation_correction_weight
-        weighted_dtheta = dtheta_correction * self.rotation_correction_weight
-        
-        # Convert pose correction to delta correction
-        # This is approximate but works for small corrections
-        corrected_delta = (
-            odom_delta[0] + weighted_dx,
-            odom_delta[1] + weighted_dy,
-            odom_delta[2] + weighted_dtheta
-        )
-        
-        correction = (weighted_dx, weighted_dy, weighted_dtheta)
-        
-        self.last_scan = local_points
-        return corrected_delta, correction
+    def get_pose(self):
+        return tuple(self.current_pose)
+    
+    def set_pose(self, x, y, theta):
+        self.current_pose = [x, y, theta]
 
 
 class SimpleWallFollower:
@@ -630,108 +611,45 @@ class OccupancyMap:
 
 
 class SLAMWithLoopClosure:
-    """Full SLAM system with scan-to-map matching and loop closure"""
+    """SLAM using scan-matching for localization (odometry-free)"""
     
     def __init__(self, initial_pose=(0, 0, 0), use_correction=True):
         self.mapper = OccupancyMap(size_meters=20, resolution=0.1)
         self.loop_detector = LoopClosureDetector(
-            distance_threshold=0.8,        # Slightly more relaxed
-            scan_similarity_threshold=0.80, # Slightly more relaxed
-            min_time_gap=80                # Allow earlier detection
+            distance_threshold=0.8,
+            scan_similarity_threshold=0.80,
+            min_time_gap=80
         )
         self.optimizer = PoseGraphOptimizer()
         
-        # Scan-to-map matcher (will be connected to occupancy map)
-        self.scan_matcher = ScanToMapMatcher()
+        # Scan-matching localizer (replaces broken odometry)
+        self.localizer = ScanMatchingLocalizer()
+        self.localizer.set_pose(initial_pose[0], initial_pose[1], initial_pose[2])
         
         # Pose graph
         self.pose_graph = []
-        self.current_pose = list(initial_pose)  # Corrected pose
+        self.current_pose = list(initial_pose)
         
-        # Track previous odometry for computing deltas
-        self.prev_odom = None
-        
-        # DEBUG: Option to disable corrections
-        self.use_correction = use_correction
-        
-        # Also track raw odometry pose for comparison
-        self.raw_odom_pose = list(initial_pose)
+        # Option to use scan matching or not
+        self.use_scan_matching = use_correction
         
         # Statistics
         self.loop_closures_detected = 0
         self.last_optimization_time = 0
-        self.total_correction = [0.0, 0.0, 0.0]  # Cumulative correction stats
+        self.total_correction = [0.0, 0.0, 0.0]
         
     def update(self, lidar_local_points, odom_x, odom_y, odom_theta):
-        """Main SLAM update with scan-to-map matching and loop closure"""
+        """Update SLAM using scan matching for localization"""
         
-        # Track raw odometry for comparison (just use directly from robot)
-        self.raw_odom_pose = [odom_x, odom_y, odom_theta]
-        
-        # Connect scan matcher to our map (for scan-to-map matching)
-        self.scan_matcher.set_map_reference(self.mapper)
-        
-        # Compute odometry delta (motion since last update)
-        if self.prev_odom is None:
-            odom_delta = (0.0, 0.0, 0.0)
+        if self.use_scan_matching:
+            # Use scan-to-scan ICP to estimate pose (ignore broken odometry)
+            est_x, est_y, est_theta = self.localizer.update(lidar_local_points)
+            self.current_pose = [est_x, est_y, est_theta]
         else:
-            # Compute relative motion in previous frame
-            dx_global = odom_x - self.prev_odom[0]
-            dy_global = odom_y - self.prev_odom[1]
-            dtheta = odom_theta - self.prev_odom[2]
-            
-            # Transform to local frame of previous pose
-            prev_theta = self.prev_odom[2]
-            cos_t = np.cos(-prev_theta)
-            sin_t = np.sin(-prev_theta)
-            
-            dx_local = cos_t * dx_global - sin_t * dy_global
-            dy_local = sin_t * dx_global + cos_t * dy_global
-            
-            odom_delta = (dx_local, dy_local, dtheta)
+            # Use raw odometry (for comparison - will be bad)
+            self.current_pose = [odom_x, odom_y, odom_theta]
         
-        # Apply odometry delta first (before correction)
-        if self.prev_odom is not None:
-            current_theta = self.current_pose[2]
-            cos_t = np.cos(current_theta)
-            sin_t = np.sin(current_theta)
-            
-            dx_global = cos_t * odom_delta[0] - sin_t * odom_delta[1]
-            dy_global = sin_t * odom_delta[0] + cos_t * odom_delta[1]
-            
-            self.current_pose[0] += dx_global
-            self.current_pose[1] += dy_global
-            self.current_pose[2] += odom_delta[2]
-            
-            # Normalize angle
-            while self.current_pose[2] > np.pi:
-                self.current_pose[2] -= 2 * np.pi
-            while self.current_pose[2] < -np.pi:
-                self.current_pose[2] += 2 * np.pi
-        
-        correction = (0, 0, 0)
-        
-        # Only apply corrections if enabled
-        if self.use_correction:
-            # Use scan-to-map matching to get correction
-            _, correction = self.scan_matcher.match_scan(
-                lidar_local_points, odom_delta, tuple(self.current_pose)
-            )
-            
-            # Apply correction to current pose
-            self.current_pose[0] += correction[0]
-            self.current_pose[1] += correction[1]
-            self.current_pose[2] += correction[2]
-        
-        # Track cumulative correction for statistics
-        self.total_correction[0] += abs(correction[0])
-        self.total_correction[1] += abs(correction[1])
-        self.total_correction[2] += abs(correction[2])
-        
-        # Store current odometry for next delta computation
-        self.prev_odom = (odom_x, odom_y, odom_theta)
-        
-        # Create new pose node with CORRECTED pose (not raw odometry)
+        # Create new pose node
         node = PoseNode(
             idx=len(self.pose_graph),
             x=self.current_pose[0],
@@ -742,7 +660,7 @@ class SLAMWithLoopClosure:
         
         self.pose_graph.append(node)
         
-        # Check for loop closure every 20 frames (less frequent)
+        # Check for loop closure every 20 frames
         if len(self.pose_graph) % 20 == 0 and len(self.pose_graph) > 150:
             loop_detected, match_idx, similarity = self.loop_detector.detect_loop_closure(
                 node, self.pose_graph
@@ -847,16 +765,18 @@ def main(args=None):
     
     iteration = 0
     print("\n" + "="*70)
-    print("FULL SLAM WITH SCAN-TO-MAP MATCHING & LOOP CLOSURE")
+    print("SLAM WITH SCAN-TO-SCAN ICP LOCALIZATION")
     print("="*70)
     print("This system will:")
-    print("  ✓ Use SCAN-TO-MAP matching (more stable than scan-to-scan)")
-    print("  ✓ Trust odometry angles more (less rotation correction)")
-    print("  ✓ Focus corrections on translation errors")
-    print("  ✓ Build a pose graph with corrected robot poses")
-    print("  ✓ Detect when robot returns to known locations")
-    print("  ✓ Optimize trajectory and rebuild map on loop closures")
-    print("\nThis should produce a more consistent map!\n")
+    print("  ✓ Use scan-to-scan ICP to estimate robot motion")
+    print("  ✓ IGNORE broken odometry completely")
+    print("  ✓ Build occupancy grid map from lidar scans")
+    print("  ✓ Track robot trajectory using scan matching")
+    print("\nModes:")
+    print("  python assigment_2.py              - Scan matching SLAM")
+    print("  python assigment_2.py --ground-truth - Use ground truth (perfect)")
+    print("  python assigment_2.py --odom-only    - Use broken odometry (bad)")
+    print("="*70 + "\n")
     
     while coppelia.is_running():
         robot.update_odometry()
