@@ -632,7 +632,7 @@ class OccupancyMap:
 class SLAMWithLoopClosure:
     """Full SLAM system with scan-to-map matching and loop closure"""
     
-    def __init__(self, initial_pose=(0, 0, 0)):
+    def __init__(self, initial_pose=(0, 0, 0), use_correction=True):
         self.mapper = OccupancyMap(size_meters=20, resolution=0.1)
         self.loop_detector = LoopClosureDetector(
             distance_threshold=0.8,        # Slightly more relaxed
@@ -651,6 +651,12 @@ class SLAMWithLoopClosure:
         # Track previous odometry for computing deltas
         self.prev_odom = None
         
+        # DEBUG: Option to disable corrections
+        self.use_correction = use_correction
+        
+        # Also track raw odometry pose for comparison
+        self.raw_odom_pose = list(initial_pose)
+        
         # Statistics
         self.loop_closures_detected = 0
         self.last_optimization_time = 0
@@ -658,6 +664,9 @@ class SLAMWithLoopClosure:
         
     def update(self, lidar_local_points, odom_x, odom_y, odom_theta):
         """Main SLAM update with scan-to-map matching and loop closure"""
+        
+        # Track raw odometry for comparison (just use directly from robot)
+        self.raw_odom_pose = [odom_x, odom_y, odom_theta]
         
         # Connect scan matcher to our map (for scan-to-map matching)
         self.scan_matcher.set_map_reference(self.mapper)
@@ -700,15 +709,19 @@ class SLAMWithLoopClosure:
             while self.current_pose[2] < -np.pi:
                 self.current_pose[2] += 2 * np.pi
         
-        # Use scan-to-map matching to get correction
-        _, correction = self.scan_matcher.match_scan(
-            lidar_local_points, odom_delta, tuple(self.current_pose)
-        )
+        correction = (0, 0, 0)
         
-        # Apply correction to current pose
-        self.current_pose[0] += correction[0]
-        self.current_pose[1] += correction[1]
-        self.current_pose[2] += correction[2]
+        # Only apply corrections if enabled
+        if self.use_correction:
+            # Use scan-to-map matching to get correction
+            _, correction = self.scan_matcher.match_scan(
+                lidar_local_points, odom_delta, tuple(self.current_pose)
+            )
+            
+            # Apply correction to current pose
+            self.current_pose[0] += correction[0]
+            self.current_pose[1] += correction[1]
+            self.current_pose[2] += correction[2]
         
         # Track cumulative correction for statistics
         self.total_correction[0] += abs(correction[0])
@@ -775,6 +788,14 @@ class SLAMWithLoopClosure:
 
 
 def main(args=None):
+    import sys
+    
+    # Check for odometry-only mode
+    USE_CORRECTION = True
+    if len(sys.argv) > 1 and sys.argv[1] == '--odom-only':
+        USE_CORRECTION = False
+        print("\n*** RUNNING IN ODOMETRY-ONLY MODE (no corrections) ***\n")
+    
     coppelia = robotica.Coppelia()
     robot = robotica.P3DX(coppelia.sim, 'PioneerP3DX', use_lidar=True)
     coppelia.start_simulation()
@@ -790,7 +811,10 @@ def main(args=None):
         front_threshold=0.30
     )
     
-    slam = SLAMWithLoopClosure(initial_pose=(0, 0, 0))
+    slam = SLAMWithLoopClosure(initial_pose=(0, 0, 0), use_correction=USE_CORRECTION)
+    
+    # Track raw odometry trajectory for comparison
+    raw_odom_trajectory = []
     
     # Visualization
     plt.ion()
@@ -825,6 +849,9 @@ def main(args=None):
         robot.update_odometry()
         odom_x, odom_y, odom_theta = robot.get_estimated_pose()
         
+        # Track raw odometry
+        raw_odom_trajectory.append((odom_x, odom_y))
+        
         raw_lidar = robot.read_lidar_data()
         
         # SLAM update with loop closure
@@ -843,12 +870,17 @@ def main(args=None):
             ax1.plot(rx, ry, 'go', markersize=8, label='Current')
             ax1.legend()
             
-            # Update trajectory plot
+            # Update trajectory plot - show BOTH raw odom and corrected
             traj_x, traj_y = slam.get_trajectory()
+            raw_x = [p[0] for p in raw_odom_trajectory]
+            raw_y = [p[1] for p in raw_odom_trajectory]
+            
             ax2.clear()
-            ax2.plot(traj_x, traj_y, 'b-', linewidth=1, alpha=0.7, label='Trajectory')
-            ax2.plot(corrected_x, corrected_y, 'ro', markersize=8, label='Current')
-            ax2.set_title(f"Trajectory (Loop Closures: {slam.loop_closures_detected})")
+            ax2.plot(raw_x, raw_y, 'r-', linewidth=1, alpha=0.5, label='Raw Odometry')
+            ax2.plot(traj_x, traj_y, 'b-', linewidth=1, alpha=0.7, label='SLAM Trajectory')
+            ax2.plot(corrected_x, corrected_y, 'go', markersize=8, label='Current')
+            ax2.plot(odom_x, odom_y, 'rx', markersize=8, label='Raw Odom Pos')
+            ax2.set_title(f"Trajectory (Loops: {slam.loop_closures_detected})")
             ax2.set_xlabel("X (m)")
             ax2.set_ylabel("Y (m)")
             ax2.grid(True)
@@ -865,9 +897,10 @@ def main(args=None):
         
         if iteration % 50 == 0:
             corr = slam.total_correction
-            print(f"Iter {iteration:04d} | Poses: {len(slam.pose_graph):04d} | "
-                  f"Loops: {slam.loop_closures_detected} | "
-                  f"Corr: ({corr[0]:.3f}, {corr[1]:.3f}, {corr[2]:.2f}rad)")
+            # Show both raw odom and corrected positions
+            print(f"Iter {iteration:04d} | RawOdom: ({odom_x:.2f}, {odom_y:.2f}, {np.degrees(odom_theta):.1f}°) | "
+                  f"SLAM: ({corrected_x:.2f}, {corrected_y:.2f}, {np.degrees(corrected_theta):.1f}°) | "
+                  f"Corr: ({corr[0]:.2f}, {corr[1]:.2f}, {corr[2]:.1f}rad)")
         
         iteration += 1
         time.sleep(0.05)
