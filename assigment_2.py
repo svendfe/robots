@@ -54,20 +54,28 @@ class LoopClosureDetector:
         return hist
     
     def compare_scans(self, sig1, sig2):
-        """Compare two scan signatures using correlation"""
+        """Compare two scan signatures using correlation (rotation invariant)"""
         if sig1 is None or sig2 is None:
             return 0.0
         
-        correlation = np.correlate(sig1, sig2, mode='valid')[0]
+        # Check all circular shifts to account for orientation drift
+        max_similarity = 0.0
         norm1 = np.linalg.norm(sig1)
         norm2 = np.linalg.norm(sig2)
         
-        if norm1 > 0 and norm2 > 0:
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+            
+        # Try all possible rotations (bins)
+        # This makes the matching robust to rotation errors in odometry
+        for shift in range(len(sig1)):
+            rolled_sig2 = np.roll(sig2, shift)
+            correlation = np.dot(sig1, rolled_sig2)
             similarity = correlation / (norm1 * norm2)
-        else:
-            similarity = 0.0
+            if similarity > max_similarity:
+                max_similarity = similarity
         
-        return similarity
+        return max_similarity
     
     def detect_loop_closure(self, current_node, pose_graph):
         """
@@ -118,7 +126,7 @@ class PoseGraphOptimizer:
     """Simple pose graph optimization for loop closure"""
     
     def __init__(self):
-        self.optimization_strength = 0.1
+        self.optimization_strength = 0.15
     
     def optimize_trajectory(self, pose_graph, loop_closure_from, loop_closure_to):
         """
@@ -434,8 +442,8 @@ class SLAMWithLoopClosure:
     def __init__(self, initial_pose=(0, 0, 0), use_loop_closure=True):
         self.mapper = OccupancyMap(size_meters=20, resolution=0.1)
         self.loop_detector = LoopClosureDetector(
-            distance_threshold=0.2,
-            scan_similarity_threshold=0.90,
+            distance_threshold=3.0,
+            scan_similarity_threshold=0.92,
             min_time_gap=80
         )
         self.optimizer = PoseGraphOptimizer()
