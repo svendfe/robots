@@ -555,6 +555,7 @@ def main(args=None):
     
     # Get initial ground truth pose
     gt_x, gt_y, gt_theta = robot.get_ground_truth_pose()
+    initial_gt_pose = (gt_x, gt_y, gt_theta)
     initial_pose = (gt_x, gt_y, gt_theta)
     print(f"\nInitial ground truth pose: ({gt_x:.2f}, {gt_y:.2f}, {np.degrees(gt_theta):.1f}°)")
     
@@ -640,11 +641,36 @@ def main(args=None):
             gt_traj_x = [p[0] for p in ground_truth_trajectory]
             gt_traj_y = [p[1] for p in ground_truth_trajectory]
             
+            # If using odometry, align GT to start at 0,0,0 for comparison
+            if not USE_GROUND_TRUTH:
+                x0, y0, theta0 = initial_gt_pose
+                c = np.cos(-theta0)
+                s = np.sin(-theta0)
+                
+                aligned_gt_x = []
+                aligned_gt_y = []
+                for gx, gy in zip(gt_traj_x, gt_traj_y):
+                    dx = gx - x0
+                    dy = gy - y0
+                    aligned_gt_x.append(dx * c - dy * s)
+                    aligned_gt_y.append(dx * s + dy * c)
+                gt_traj_x = aligned_gt_x
+                gt_traj_y = aligned_gt_y
+                
+                # Also align current GT marker
+                curr_dx = gt_x - x0
+                curr_dy = gt_y - y0
+                curr_gt_x = curr_dx * c - curr_dy * s
+                curr_gt_y = curr_dx * s + curr_dy * c
+            else:
+                curr_gt_x = gt_x
+                curr_gt_y = gt_y
+            
             ax2.clear()
             ax2.plot(gt_traj_x, gt_traj_y, 'g-', linewidth=2, alpha=0.8, label='Ground Truth')
             ax2.plot(traj_x, traj_y, 'b-', linewidth=1, alpha=0.7, label='Odometry Trajectory')
             ax2.plot(corrected_x, corrected_y, 'bo', markersize=8, label='Current Odom')
-            ax2.plot(gt_x, gt_y, 'g*', markersize=10, label='Current GT')
+            ax2.plot(curr_gt_x, curr_gt_y, 'g*', markersize=10, label='Current GT')
             ax2.set_title(f"Trajectory Comparison")
             ax2.set_xlabel("X (m)")
             ax2.set_ylabel("Y (m)")
