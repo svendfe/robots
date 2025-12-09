@@ -58,7 +58,7 @@ class P3DX():
     num_sonar = 16
     sonar_max = 1.0
 
-    WHEEL_RADIUS = 0.095
+    WHEEL_RADIUS = 0.0975
     WHEEL_BASE = 0.381
 
     def __init__(self, sim, robot_id, use_camera=False, use_lidar=False):
@@ -82,6 +82,7 @@ class P3DX():
             self.lidar_script = self.sim.getScript(self.sim.scripttype_childscript, self.lidar_handle)
 
         self.dt = self.sim.getSimulationTimeStep()
+        self.last_sim_time = self.sim.getSimulationTime()
         # --- INTERNAL STATE (ODOMETRY) ---
         # We start at 0,0,0 relative to where we turned on the robot
         self.x = 0.0
@@ -93,6 +94,14 @@ class P3DX():
         Calculates the new position based on wheel rotation.
         Call this EVERY simulation step.
         """
+        # Calculate time delta since last update
+        current_time = self.sim.getSimulationTime()
+        dt = current_time - self.last_sim_time
+        self.last_sim_time = current_time
+        
+        if dt <= 0:
+            return
+
         # 1. Get current velocity of wheels (Rad/s)
         # We use getJointVelocity to see what the physics engine is actually doing
         vl = self.sim.getJointVelocity(self.left_motor)
@@ -105,13 +114,13 @@ class P3DX():
         # 3. Update Position (Integration)
         # 4. Update Position (Exact Arc Integration)
         if abs(w) < 1e-6: # Moving straight (avoid division by zero)
-            self.x += v * np.cos(self.theta) * self.dt
-            self.y += v * np.sin(self.theta) * self.dt
-            self.theta += w * self.dt
+            self.x += v * np.cos(self.theta) * dt
+            self.y += v * np.sin(self.theta) * dt
+            self.theta += w * dt
         else: # Moving in an arc
-            self.x += (v / w) * (np.sin(self.theta + w * self.dt) - np.sin(self.theta))
-            self.y -= (v / w) * (np.cos(self.theta + w * self.dt) - np.cos(self.theta))
-            self.theta += w * self.dt
+            self.x += (v / w) * (np.sin(self.theta + w * dt) - np.sin(self.theta))
+            self.y -= (v / w) * (np.cos(self.theta + w * dt) - np.cos(self.theta))
+            self.theta += w * dt
 
         # Normalize theta
         self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
