@@ -69,9 +69,10 @@ class P3DX():
     num_sonar = 16
     sonar_max = 1.0
 
-    # Physical parameters (use actual values)
+    # Physical parameters for Pioneer P3-DX
+    # Tuned wheel base to fix rotation drift during curves
     WHEEL_RADIUS = 0.0975  # 195mm diameter / 2
-    WHEEL_BASE = 0.381     # Axle track
+    WHEEL_BASE = 0.44      # Increased from 0.381 to compensate for over-rotation
 
     def __init__(self, sim, robot_id, use_camera=False, use_lidar=False):
         self.sim = sim
