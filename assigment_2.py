@@ -18,6 +18,224 @@ class PoseNode:
         self.scan = scan  # Store lidar scan for loop closure detection
 
 
+class ScanMatcher:
+    """2D ICP (Iterative Closest Point) scan matching for odometry correction"""
+    
+    def __init__(self, max_iterations=20, tolerance=1e-4, 
+                 max_correspondence_dist=0.3, min_points=10):
+        self.max_iterations = max_iterations
+        self.tolerance = tolerance
+        self.max_correspondence_dist = max_correspondence_dist
+        self.min_points = min_points
+        
+        # Statistics
+        self.total_matches = 0
+        self.successful_matches = 0
+    
+    def preprocess_scan(self, scan_points, max_range=4.0, min_range=0.1, downsample_factor=2):
+        """Convert raw scan to numpy array, filter and downsample"""
+        if len(scan_points) == 0:
+            return np.array([]).reshape(0, 2)
+        
+        # Convert to numpy array
+        data = np.array(scan_points).reshape(-1, 3)
+        x, y = data[:, 0], data[:, 1]
+        
+        # Filter by range
+        distances = np.sqrt(x**2 + y**2)
+        valid = (distances > min_range) & (distances < max_range)
+        points = np.column_stack([x[valid], y[valid]])
+        
+        # Downsample for efficiency
+        if len(points) > 0 and downsample_factor > 1:
+            points = points[::downsample_factor]
+        
+        return points
+    
+    def find_correspondences(self, source_points, target_points):
+        """Find nearest neighbors using KDTree"""
+        if len(source_points) == 0 or len(target_points) == 0:
+            return np.array([]).reshape(0, 2), np.array([])
+        
+        # Build KDTree of target points
+        tree = KDTree(target_points)
+        
+        # Query for each source point
+        distances, indices = tree.query(source_points)
+        
+        # Filter by maximum correspondence distance
+        valid_mask = distances < self.max_correspondence_dist
+        
+        # Create array of correspondence pairs [source_idx, target_idx]
+        source_indices = np.where(valid_mask)[0]
+        target_indices = indices[valid_mask]
+        
+        correspondences = np.column_stack([source_indices, target_indices])
+        valid_distances = distances[valid_mask]
+        
+        return correspondences, valid_distances
+    
+    def estimate_transform_svd(self, source_matched, target_matched):
+        """Estimate 2D rigid transform (dx, dy, dtheta) using SVD"""
+        if len(source_matched) < 3:
+            return 0.0, 0.0, 0.0
+        
+        # Center the point clouds
+        source_center = np.mean(source_matched, axis=0)
+        target_center = np.mean(target_matched, axis=0)
+        
+        source_centered = source_matched - source_center
+        target_centered = target_matched - target_center
+        
+        # Compute covariance matrix
+        H = source_centered.T @ target_centered
+        
+        # SVD decomposition
+        U, _, Vt = np.linalg.svd(H)
+        
+        # Compute rotation matrix
+        R = Vt.T @ U.T
+        
+        # Handle reflection case (determinant should be 1, not -1)
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+        
+        # Extract rotation angle
+        dtheta = np.arctan2(R[1, 0], R[0, 0])
+        
+        # Compute translation
+        t = target_center - (R @ source_center)
+        dx, dy = t[0], t[1]
+        
+        return dx, dy, dtheta
+    
+    def apply_transform(self, points, dx, dy, dtheta):
+        """Apply 2D rigid transform to points"""
+        if len(points) == 0:
+            return points
+        
+        # Rotation matrix
+        c = np.cos(dtheta)
+        s = np.sin(dtheta)
+        R = np.array([[c, -s], [s, c]])
+        
+        # Apply rotation then translation
+        transformed = (R @ points.T).T
+        transformed[:, 0] += dx
+        transformed[:, 1] += dy
+        
+        return transformed
+    
+    def icp(self, source_scan, target_scan, initial_guess=(0, 0, 0)):
+        """
+        Run ICP algorithm to align source scan to target scan.
+        
+        Returns: (dx, dy, dtheta, confidence)
+        """
+        # Preprocess scans
+        source = self.preprocess_scan(source_scan)
+        target = self.preprocess_scan(target_scan)
+        
+        # Check minimum points
+        if len(source) < self.min_points or len(target) < self.min_points:
+            return initial_guess + (0.0,)  # Return with zero confidence
+        
+        # Apply initial guess to source
+        dx, dy, dtheta = initial_guess
+        transformed_source = self.apply_transform(source, dx, dy, dtheta)
+        
+        # Track cumulative transform
+        total_dx, total_dy, total_dtheta = dx, dy, dtheta
+        
+        # ICP iterations
+        prev_error = float('inf')
+        for iteration in range(self.max_iterations):
+            # Find correspondences
+            correspondences, distances = self.find_correspondences(
+                transformed_source, target
+            )
+            
+            # Check if we have enough correspondences
+            if len(correspondences) < self.min_points:
+                confidence = 0.0
+                return (total_dx, total_dy, total_dtheta, confidence)
+            
+            # Compute mean error
+            mean_error = np.mean(distances)
+            
+            # Check convergence
+            if abs(prev_error - mean_error) < self.tolerance:
+                break
+            prev_error = mean_error
+            
+            # Get matched point pairs
+            source_matched = transformed_source[correspondences[:, 0]]
+            target_matched = target[correspondences[:, 1]]
+            
+            # Estimate incremental transform
+            inc_dx, inc_dy, inc_dtheta = self.estimate_transform_svd(
+                source_matched, target_matched
+            )
+            
+            # Check if incremental transform is too small
+            if (abs(inc_dx) < self.tolerance and 
+                abs(inc_dy) < self.tolerance and 
+                abs(inc_dtheta) < self.tolerance):
+                break
+            
+            # Apply incremental transform
+            transformed_source = self.apply_transform(
+                transformed_source, inc_dx, inc_dy, inc_dtheta
+            )
+            
+            # Update total transform
+            total_dx += inc_dx
+            total_dy += inc_dy
+            total_dtheta += inc_dtheta
+        
+        # Compute confidence based on final alignment quality
+        # Good alignment = low mean distance and high number of correspondences
+        final_correspondences, final_distances = self.find_correspondences(
+            transformed_source, target
+        )
+        
+        if len(final_distances) > 0:
+            mean_dist = np.mean(final_distances)
+            correspondence_ratio = len(final_correspondences) / len(source)
+            
+            # Confidence metric: higher when distance is low and many points match
+            confidence = correspondence_ratio * (1.0 / (1.0 + mean_dist * 10))
+            confidence = np.clip(confidence, 0.0, 1.0)
+        else:
+            confidence = 0.0
+        
+        return (total_dx, total_dy, total_dtheta, confidence)
+    
+    def match_scans(self, current_scan, previous_scan, odom_delta):
+        """
+        Match two consecutive scans using ICP with odometry as initial guess.
+        
+        Args:
+            current_scan: Current lidar scan (raw points)
+            previous_scan: Previous lidar scan (raw points)
+            odom_delta: Odometry-based motion estimate (dx, dy, dtheta)
+        
+        Returns: (dx, dy, dtheta, confidence)
+        """
+        self.total_matches += 1
+        
+        # Run ICP with odometry as initial guess
+        dx, dy, dtheta, confidence = self.icp(
+            current_scan, previous_scan, initial_guess=odom_delta
+        )
+        
+        if confidence > 0.5:
+            self.successful_matches += 1
+        
+        return dx, dy, dtheta, confidence
+
+
 class LoopClosureDetector:
     """Detects when robot returns to previously visited location"""
     
@@ -58,7 +276,6 @@ class LoopClosureDetector:
         if sig1 is None or sig2 is None:
             return 0.0
         
-        # Check all circular shifts to account for orientation drift
         max_similarity = 0.0
         norm1 = np.linalg.norm(sig1)
         norm2 = np.linalg.norm(sig2)
@@ -66,8 +283,6 @@ class LoopClosureDetector:
         if norm1 == 0 or norm2 == 0:
             return 0.0
             
-        # Try all possible rotations (bins)
-        # This makes the matching robust to rotation errors in odometry
         for shift in range(len(sig1)):
             rolled_sig2 = np.roll(sig2, shift)
             correlation = np.dot(sig1, rolled_sig2)
@@ -78,10 +293,7 @@ class LoopClosureDetector:
         return max_similarity
     
     def detect_loop_closure(self, current_node, pose_graph):
-        """
-        Check if current pose is close to any previous pose.
-        Returns: (loop_detected, matched_node_idx, similarity_score)
-        """
+        """Check if current pose is close to any previous pose"""
         if len(pose_graph) < self.min_time_gap:
             return False, None, 0.0
         
@@ -129,9 +341,7 @@ class PoseGraphOptimizer:
         self.optimization_strength = 0.15
     
     def optimize_trajectory(self, pose_graph, loop_closure_from, loop_closure_to):
-        """
-        Distribute error correction across trajectory between loop closure points.
-        """
+        """Distribute error correction across trajectory between loop closure points"""
         if loop_closure_from >= loop_closure_to:
             return pose_graph
         
@@ -283,11 +493,11 @@ class SimpleWallFollower:
         
         self.wall_lost_counter = 0
         self.turning_to_follow = False
-        self.wall_lost_steps = 25
+        self.wall_lost_steps = 40
         
-        self.back_duration = 10
-        self.turn_duration = 10
-        self.forward_duration = 8
+        self.back_duration = 20
+        self.turn_duration = 50
+        self.forward_duration = 6
         
     def get_sensor(self, dist, idx):
         v = dist[idx]
@@ -329,9 +539,9 @@ class SimpleWallFollower:
         
         if self.corner_phase == 'back':
             if self.follow_side == 'left':
-                left, right = -0.10, -0.15
+                left, right = -0.50, -0.75
             else:
-                left, right = -0.15, -0.10
+                left, right = -0.75, -0.50
             
             if self.corner_step >= self.back_duration:
                 self.corner_phase = 'turn'
@@ -341,9 +551,9 @@ class SimpleWallFollower:
         
         elif self.corner_phase == 'turn':
             if self.follow_side == 'left':
-                left, right = 0.25, -0.25
+                left, right = 0.80, -0.80
             else:
-                left, right = -0.25, 0.25
+                left, right = -0.80, 0.80
             
             if self.corner_step >= self.turn_duration:
                 self.corner_phase = 'forward'
@@ -386,11 +596,11 @@ class SimpleWallFollower:
                 self.turning_to_follow = True
                 
                 if self.follow_side == 'left':
-                    left_speed = 0.22
-                    right_speed = 0.45
+                    left_speed = 0.10
+                    right_speed = 0.50
                 else:
-                    left_speed = 0.45
-                    right_speed = 0.22
+                    left_speed = 0.50
+                    right_speed = 0.10
                 
                 return left_speed, right_speed
             else:
@@ -436,15 +646,15 @@ class SimpleWallFollower:
         return left_speed, right_speed
 
 
-class SLAMWithLoopClosure:
-    """SLAM using odometry for localization"""
+class SLAMWithScanMatching:
+    """SLAM using scan matching to correct odometry drift"""
     
-    def __init__(self, initial_pose=(0, 0, 0), use_loop_closure=True):
+    def __init__(self, initial_pose=(0, 0, 0), use_scan_matching=True, use_loop_closure=True):
         self.mapper = OccupancyMap(size_meters=20, resolution=0.1)
         self.loop_detector = LoopClosureDetector(
-            distance_threshold=3.0,
-            scan_similarity_threshold=0.92,
-            min_time_gap=80
+            distance_threshold=2.0,
+            scan_similarity_threshold=0.96,
+            min_time_gap=150
         )
         self.optimizer = PoseGraphOptimizer()
         
@@ -452,63 +662,182 @@ class SLAMWithLoopClosure:
         self.pose_graph = []
         self.current_pose = list(initial_pose)
         
-        # Option to use loop closure or not
+        # Scan matching
+        self.scan_matcher = ScanMatcher(
+            max_iterations=20,
+            tolerance=1e-4,
+            max_correspondence_dist=0.3,
+            min_points=10
+        )
+        self.last_scan = None
+        self.last_odom_pose = None
+        
+        # --- NEW: Keyframe & Gating Parameters ---
+        # Track the odometry pose when we took the last keyframe
+        self.keyframe_odom_pose = list(initial_pose)
+        
+        # Keyframe Thresholds: Only run ICP if we moved this much
+        self.keyframe_dist_thresh = 0.15  # 15 cm
+        self.keyframe_angle_thresh = 0.1  # ~5.7 degrees
+        
+        # Validation Gate: Reject ICP if it disagrees with Odometry by this much
+        # This prevents the "Spikes" seen in your logs (e.g. Iter 300)
+        self.gate_dist_thresh = 0.15      # Max 15cm discrepancy allowed
+        self.gate_angle_thresh = 0.1      # Max ~5.7 degrees discrepancy
+        # -----------------------------------------
+        
+        # Options
+        self.use_scan_matching = use_scan_matching
         self.use_loop_closure = use_loop_closure
+        self.confidence_threshold = 0.5 
         
         # Statistics
         self.loop_closures_detected = 0
         self.last_optimization_time = 0
-        
+        self.scan_match_used_count = 0
+        self.odom_fallback_count = 0
+    # Add this helper method to the SLAM class
+    def check_front_wall(self, lidar_points):
+        """Returns True if there is a wall directly in front (< 2m)"""
+        if len(lidar_points) == 0: return False
+        data = np.array(lidar_points).reshape(-1, 3)
+        # Filter for points in front cone (+/- 15 degrees)
+        angle = np.arctan2(data[:, 1], data[:, 0])
+        dist = np.sqrt(data[:, 0]**2 + data[:, 1]**2)
+        front_points = (np.abs(angle) < np.radians(15)) & (dist < 2.0)
+        return np.sum(front_points) > 10
+
     def update(self, lidar_local_points, odom_x, odom_y, odom_theta):
-        """Update SLAM using odometry for localization"""
+        """
+        Robust Update with Keyframes, Gating, and Odometry Fallback.
+        Ensures map updates even if ICP fails.
+        """
         
-        # Use odometry directly
-        self.current_pose = [odom_x, odom_y, odom_theta]
+        # 1. Initialization
+        if self.last_odom_pose is None:
+            self.last_odom_pose = (odom_x, odom_y, odom_theta)
+            self.keyframe_odom_pose = (odom_x, odom_y, odom_theta)
+            self.last_scan = copy.deepcopy(lidar_local_points)
+            node = PoseNode(0, self.current_pose[0], self.current_pose[1], self.current_pose[2], copy.deepcopy(lidar_local_points))
+            self.pose_graph.append(node)
+            return tuple(self.current_pose)
+
+        # 2. Dead Reckoning (Odometry Prediction)
+        # Always update current_pose based on wheel encoders (high frequency)
+        step_global_dx = odom_x - self.last_odom_pose[0]
+        step_global_dy = odom_y - self.last_odom_pose[1]
+        step_dtheta = odom_theta - self.last_odom_pose[2]
+        step_dtheta = (step_dtheta + np.pi) % (2 * np.pi) - np.pi
         
-        # Create new pose node
-        node = PoseNode(
-            idx=len(self.pose_graph),
-            x=self.current_pose[0],
-            y=self.current_pose[1],
-            theta=self.current_pose[2],
-            scan=copy.deepcopy(lidar_local_points)
-        )
+        # Convert global step to local frame
+        prev_theta = self.last_odom_pose[2]
+        c, s = np.cos(prev_theta), np.sin(prev_theta)
+        local_step_dx = step_global_dx * c + step_global_dy * s
+        local_step_dy = -step_global_dx * s + step_global_dy * c
         
-        self.pose_graph.append(node)
+        # Apply to current SLAM pose
+        curr_theta = self.current_pose[2]
+        c_curr, s_curr = np.cos(curr_theta), np.sin(curr_theta)
         
-        # Check for loop closure if enabled
-        if self.use_loop_closure and len(self.pose_graph) % 20 == 0 and len(self.pose_graph) > 150:
-            loop_detected, match_idx, similarity = self.loop_detector.detect_loop_closure(
-                node, self.pose_graph
+        self.current_pose[0] += local_step_dx * c_curr - local_step_dy * s_curr
+        self.current_pose[1] += local_step_dx * s_curr + local_step_dy * c_curr
+        self.current_pose[2] += step_dtheta
+        self.current_pose[2] = (self.current_pose[2] + np.pi) % (2 * np.pi) - np.pi
+        
+        self.last_odom_pose = (odom_x, odom_y, odom_theta)
+
+        # 3. Keyframe Decision
+        # Check distance from LAST KEYFRAME (not last step)
+        kf_dx = odom_x - self.keyframe_odom_pose[0]
+        kf_dy = odom_y - self.keyframe_odom_pose[1]
+        kf_dist = np.sqrt(kf_dx**2 + kf_dy**2)
+        kf_dtheta = abs((odom_theta - self.keyframe_odom_pose[2] + np.pi) % (2*np.pi) - np.pi)
+        
+        should_update_graph = (kf_dist > self.keyframe_dist_thresh or kf_dtheta > self.keyframe_angle_thresh)
+        
+        # If we haven't moved enough, just return the Odometry Prediction
+        if not should_update_graph or len(lidar_local_points) < 10:
+            return tuple(self.current_pose)
+
+        # 4. Prepare ICP Guess
+        # Calculate the total movement since the last keyframe in the KEYFRAME'S coordinate system
+        kf_theta_raw = self.keyframe_odom_pose[2]
+        c_kf, s_kf = np.cos(kf_theta_raw), np.sin(kf_theta_raw)
+        
+        global_kf_dx = odom_x - self.keyframe_odom_pose[0]
+        global_kf_dy = odom_y - self.keyframe_odom_pose[1]
+        global_kf_dtheta = odom_theta - self.keyframe_odom_pose[2]
+        global_kf_dtheta = (global_kf_dtheta + np.pi) % (2 * np.pi) - np.pi
+        
+        guess_dx = global_kf_dx * c_kf + global_kf_dy * s_kf
+        guess_dy = -global_kf_dx * s_kf + global_kf_dy * c_kf
+        guess_dtheta = global_kf_dtheta
+
+        # 5. Run Scan Matching
+        # We try to refine the "guess" using ICP
+        icp_success = False
+        scan_dx, scan_dy, scan_dtheta = guess_dx, guess_dy, guess_dtheta # Default to Odom
+
+        if self.use_scan_matching:
+            scan_dx, scan_dy, scan_dtheta, confidence = self.scan_matcher.match_scans(
+                lidar_local_points, 
+                self.last_scan,
+                odom_delta=(guess_dx, guess_dy, guess_dtheta)
             )
             
-            if loop_detected:
-                self.loop_closures_detected += 1
-                print(f"\n🔄 LOOP CLOSURE DETECTED!")
-                print(f"   Current node: {node.idx} matched with node: {match_idx}")
-                print(f"   Similarity: {similarity:.3f}")
-                print(f"   Optimizing pose graph...")
-                
-                # Optimize trajectory
-                self.pose_graph = self.optimizer.optimize_trajectory(
-                    self.pose_graph, match_idx, node.idx
-                )
-                
-                # Rebuild map from corrected trajectory
-                print(f"   Rebuilding map from optimized poses...")
-                self.mapper.rebuild_from_trajectory(self.pose_graph)
-                print(f"   ✓ Map updated!\n")
-                
-                self.last_optimization_time = len(self.pose_graph)
+            # Validation Gate
+            error_x = abs(scan_dx - guess_dx)
+            error_y = abs(scan_dy - guess_dy)
+            error_th = abs((scan_dtheta - guess_dtheta + np.pi) % (2*np.pi) - np.pi)
+            
+            gate_passed = (error_x < self.gate_dist_thresh) and \
+                          (error_y < self.gate_dist_thresh) and \
+                          (error_th < self.gate_angle_thresh)
+            
+            if confidence > self.confidence_threshold and gate_passed:
+                icp_success = True
+                self.scan_match_used_count += 1
+            else:
+                # ICP Failed or Rejected -> Revert to Odometry Guess
+                scan_dx, scan_dy, scan_dtheta = guess_dx, guess_dy, guess_dtheta
+                self.odom_fallback_count += 1
         
-        # Update current pose to latest node (possibly corrected)
-        latest_node = self.pose_graph[-1]
-        self.current_pose = [latest_node.x, latest_node.y, latest_node.theta]
+        # 6. Update Pose Graph & Map (Perform this regardless of ICP success)
+        # We use 'scan_dx/dy/theta' which is either the Refined ICP or the Original Odometry
         
-        # Update map incrementally if no recent optimization
-        if len(self.pose_graph) - self.last_optimization_time > 5:
-            self.mapper.update_map(lidar_local_points, latest_node.x, latest_node.y, latest_node.theta)
+        last_node = self.pose_graph[-1]
+        c_node, s_node = np.cos(last_node.theta), np.sin(last_node.theta)
         
+        # Calculate new Global Pose based on the Last Node + The Delta
+        new_x = last_node.x + (scan_dx * c_node - scan_dy * s_node)
+        new_y = last_node.y + (scan_dx * s_node + scan_dy * c_node)
+        new_theta = last_node.theta + scan_dtheta
+        new_theta = (new_theta + np.pi) % (2 * np.pi) - np.pi
+        
+        # Snap current pose to this new stable node
+        self.current_pose = [new_x, new_y, new_theta]
+        
+        # Update State (Reset Keyframe accumulators)
+        self.last_scan = copy.deepcopy(lidar_local_points)
+        self.keyframe_odom_pose = (odom_x, odom_y, odom_theta)
+        
+        # Add Node
+        node = PoseNode(len(self.pose_graph), new_x, new_y, new_theta, copy.deepcopy(lidar_local_points))
+        self.pose_graph.append(node)
+        
+        # Update Map
+        self.mapper.update_map(lidar_local_points, new_x, new_y, new_theta)
+        
+        # Loop Closure (Optional)
+        if self.use_loop_closure and len(self.pose_graph) % 10 == 0 and len(self.pose_graph) > 50:
+             loop_detected, match_idx, _ = self.loop_detector.detect_loop_closure(node, self.pose_graph)
+             if loop_detected:
+                 self.pose_graph = self.optimizer.optimize_trajectory(self.pose_graph, match_idx, node.idx)
+                 self.mapper.rebuild_from_trajectory(self.pose_graph)
+                 self.last_optimization_time = len(self.pose_graph)
+                 latest = self.pose_graph[-1]
+                 self.current_pose = [latest.x, latest.y, latest.theta]
+
         return tuple(self.current_pose)
     
     def get_trajectory(self):
@@ -520,32 +849,59 @@ class SLAMWithLoopClosure:
         ys = [node.y for node in self.pose_graph]
         return xs, ys
 
+    def check_front_obstacle(self, lidar_points, angle_range=np.radians(20), dist_threshold=2.0):
+        """
+        Check if there are features in front of the robot that allow reliable X-correction.
+        Returns: True if valid features exist in front (not just a corridor).
+        """
+        if len(lidar_points) == 0: return False
+        
+        # Extract X, Y
+        data = np.array(lidar_points).reshape(-1, 3)
+        x = data[:, 0]
+        y = data[:, 1]
+        
+        # Calculate angles and distances
+        angles = np.arctan2(y, x)
+        dists = np.sqrt(x**2 + y**2)
+        
+        # Look for points in the front cone (+/- 20 degrees)
+        # and within reliable range (< 2.0 meters)
+        front_mask = (np.abs(angles) < angle_range) & (dists < dist_threshold) & (dists > 0.1)
+        
+        # If we have enough points in front, we can trust ICP for forward motion
+        return np.sum(front_mask) > 15
 
 def main(args=None):
     import sys
     
     # Check for mode
     USE_GROUND_TRUTH = False
+    USE_SCAN_MATCHING = True
     USE_LOOP_CLOSURE = True
     
     if len(sys.argv) > 1:
-        if sys.argv[1] == '--no-loop-closure':
+        if sys.argv[1] == '--no-scan-matching':
+            USE_SCAN_MATCHING = False
+            print("\n*** RUNNING WITHOUT SCAN MATCHING (odometry only) ***\n")
+        elif sys.argv[1] == '--no-loop-closure':
             USE_LOOP_CLOSURE = False
             print("\n*** RUNNING WITHOUT LOOP CLOSURE ***\n")
         elif sys.argv[1] == '--ground-truth':
             USE_GROUND_TRUTH = True
+            USE_SCAN_MATCHING = False
             USE_LOOP_CLOSURE = False
             print("\n*** RUNNING WITH GROUND TRUTH POSE (from simulator) ***")
             print("*** This shows what the map SHOULD look like with perfect localization ***\n")
     
     coppelia = robotica.Coppelia()
     robot = robotica.P3DX(coppelia.sim, 'PioneerP3DX', use_lidar=True)
-    coppelia.start_simulation(stepping=True)  # Enable stepping mode for synchronized simulation
+    coppelia.start_simulation(stepping=True)
     
     wf = SimpleWallFollower(
         base_speed=0.6,
         follow_side='left',
-        target_dist=0.15,
+        target_dist=0.25,
         kp=2.0,
         ki=0.05,
         kd=0.7,
@@ -556,10 +912,14 @@ def main(args=None):
     # Get initial ground truth pose
     gt_x, gt_y, gt_theta = robot.get_ground_truth_pose()
     initial_gt_pose = (gt_x, gt_y, gt_theta)
-    initial_pose = (gt_x, gt_y, gt_theta)
+    initial_pose = (0, 0, 0)
     print(f"\nInitial ground truth pose: ({gt_x:.2f}, {gt_y:.2f}, {np.degrees(gt_theta):.1f}°)")
     
-    slam = SLAMWithLoopClosure(initial_pose=initial_pose, use_loop_closure=USE_LOOP_CLOSURE)
+    slam = SLAMWithScanMatching(
+        initial_pose=initial_pose,
+        use_scan_matching=USE_SCAN_MATCHING,
+        use_loop_closure=USE_LOOP_CLOSURE
+    )
     
     # Track trajectories for comparison
     ground_truth_trajectory = []
@@ -570,7 +930,7 @@ def main(args=None):
     
     img = ax1.imshow(slam.mapper.get_probability_grid(threshold=True, smooth=True), 
                      cmap='gray', vmin=0, vmax=1, origin='lower')
-    ax1.set_title("SLAM Map with Odometry")
+    ax1.set_title("SLAM Map")
     ax1.set_xlabel("Grid X")
     ax1.set_ylabel("Grid Y")
     
@@ -582,20 +942,25 @@ def main(args=None):
     
     iteration = 0
     print("\n" + "="*70)
-    print("SLAM WITH ODOMETRY (update_odometry)")
+    print("SLAM WITH SCAN MATCHING")
     print("="*70)
     print("This system will:")
-    print("  ✓ Use robot.update_odometry() for pose estimation")
+    print("  ✓ Use robot.update_odometry() for initial pose estimation")
+    if USE_SCAN_MATCHING:
+        print("  ✓ Apply ICP scan matching to correct odometry drift")
+    else:
+        print("  ✗ Scan matching disabled (odometry only)")
     print("  ✓ Build occupancy grid map from lidar scans")
-    print("  ✓ Track robot trajectory using odometry")
+    print("  ✓ Track robot trajectory")
     if USE_LOOP_CLOSURE:
-        print("  ✓ Detect loop closures to correct drift")
+        print("  ✓ Detect loop closures for global correction")
     else:
         print("  ✗ Loop closure disabled")
     print("\nModes:")
-    print("  python assignment_2.py                 - Odometry + loop closure")
-    print("  python assignment_2.py --no-loop-closure - Odometry only")
-    print("  python assignment_2.py --ground-truth    - Use ground truth (perfect)")
+    print("  python assignment_2_scan_match.py                    - Full SLAM with scan matching")
+    print("  python assignment_2_scan_match.py --no-scan-matching - Odometry only")
+    print("  python assignment_2_scan_match.py --no-loop-closure  - Scan match without loop closure")
+    print("  python assignment_2_scan_match.py --ground-truth     - Use ground truth (perfect)")
     print("="*70 + "\n")
     
     while coppelia.is_running():
@@ -612,7 +977,7 @@ def main(args=None):
         # Get lidar data
         raw_lidar = robot.read_lidar_data()
         
-        # Use ground truth or odometry based on mode
+        # Use ground truth or SLAM based on mode
         if USE_GROUND_TRUTH:
             # Directly use ground truth
             corrected_x, corrected_y, corrected_theta = gt_x, gt_y, gt_theta
@@ -620,7 +985,7 @@ def main(args=None):
             node = PoseNode(len(slam.pose_graph), gt_x, gt_y, gt_theta, copy.deepcopy(raw_lidar))
             slam.pose_graph.append(node)
         else:
-            # SLAM update with odometry
+            # SLAM update with scan matching
             corrected_x, corrected_y, corrected_theta = slam.update(
                 raw_lidar, odom_x, odom_y, odom_theta
             )
@@ -641,7 +1006,7 @@ def main(args=None):
             gt_traj_x = [p[0] for p in ground_truth_trajectory]
             gt_traj_y = [p[1] for p in ground_truth_trajectory]
             
-            # If using odometry, align GT to start at 0,0,0 for comparison
+            # If using SLAM, align GT to start at 0,0,0 for comparison
             if not USE_GROUND_TRUTH:
                 x0, y0, theta0 = initial_gt_pose
                 c = np.cos(-theta0)
@@ -668,10 +1033,17 @@ def main(args=None):
             
             ax2.clear()
             ax2.plot(gt_traj_x, gt_traj_y, 'g-', linewidth=2, alpha=0.8, label='Ground Truth')
-            ax2.plot(traj_x, traj_y, 'b-', linewidth=1, alpha=0.7, label='Odometry Trajectory')
-            ax2.plot(corrected_x, corrected_y, 'bo', markersize=8, label='Current Odom')
+            ax2.plot(traj_x, traj_y, 'b-', linewidth=1, alpha=0.7, label='SLAM Trajectory')
+            ax2.plot(corrected_x, corrected_y, 'bo', markersize=8, label='Current SLAM')
             ax2.plot(curr_gt_x, curr_gt_y, 'g*', markersize=10, label='Current GT')
-            ax2.set_title(f"Trajectory Comparison")
+            
+            # Add scan matching stats to title
+            if USE_SCAN_MATCHING and slam.scan_matcher.total_matches > 0:
+                success_rate = 100.0 * slam.scan_matcher.successful_matches / slam.scan_matcher.total_matches
+                ax2.set_title(f"Trajectory (Scan Match Success: {success_rate:.1f}%)")
+            else:
+                ax2.set_title("Trajectory Comparison")
+            
             ax2.set_xlabel("X (m)")
             ax2.set_ylabel("Y (m)")
             ax2.grid(True)
@@ -686,16 +1058,16 @@ def main(args=None):
         left_speed, right_speed = wf.step(dist)
         robot.set_speed(left_speed, right_speed)
         
-        # Step the simulation forward (synchronized mode)
+        # Step the simulation forward
         coppelia.step()
         
         if iteration % 50 == 0:
             print(f"Iter {iteration:04d} | GT: ({gt_x:.2f}, {gt_y:.2f}, {np.degrees(gt_theta):.0f}°) | "
-                  f"Odom: ({corrected_x:.2f}, {corrected_y:.2f}, {np.degrees(corrected_theta):.0f}°)")
+                  f"SLAM: ({corrected_x:.2f}, {corrected_y:.2f}, {np.degrees(corrected_theta):.0f}°)")
         
         iteration += 1
-        # No sleep needed - stepping mode synchronizes simulation with Python
-    
+        time.sleep(0.01)
+
     coppelia.stop_simulation()
     
     print("\n" + "="*70)
@@ -703,9 +1075,24 @@ def main(args=None):
     print("="*70)
     print(f"Total iterations: {iteration}")
     print(f"Pose graph nodes: {len(slam.pose_graph)}")
-    print(f"Loop closures detected: {slam.loop_closures_detected}")
-    print(f"\n{'✓' if slam.loop_closures_detected > 0 else '✗'} Loop closure {'ACTIVE' if slam.loop_closures_detected > 0 else 'not triggered'}")
-    print(f"{'✓'} Using update_odometry() for localization")
+    
+    if USE_SCAN_MATCHING:
+        print(f"\nScan Matching:")
+        print(f"  Total matches attempted: {slam.scan_matcher.total_matches}")
+        print(f"  Successful matches: {slam.scan_matcher.successful_matches}")
+        if slam.scan_matcher.total_matches > 0:
+            success_rate = 100.0 * slam.scan_matcher.successful_matches / slam.scan_matcher.total_matches
+            print(f"  Success rate: {success_rate:.1f}%")
+        print(f"  Scan match used: {slam.scan_match_used_count} times")
+        print(f"  Odometry fallback: {slam.odom_fallback_count} times")
+    
+    if USE_LOOP_CLOSURE:
+        print(f"\nLoop Closure:")
+        print(f"  Detections: {slam.loop_closures_detected}")
+        print(f"  Status: {'✓ ACTIVE' if slam.loop_closures_detected > 0 else '✗ not triggered'}")
+    
+    print(f"\n{'✓' if USE_SCAN_MATCHING else '✗'} Scan matching {'ENABLED' if USE_SCAN_MATCHING else 'DISABLED'}")
+    print(f"{'✓' if USE_LOOP_CLOSURE else '✗'} Loop closure {'ENABLED' if USE_LOOP_CLOSURE else 'DISABLED'}")
     print("="*70)
 
 
